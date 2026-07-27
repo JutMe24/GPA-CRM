@@ -1,0 +1,6 @@
+{
+  "name": "Cabinet CRM Assurance - Auto, Habitation, VTC",
+  "description": "CRM complet de gestion des leads d'assurance Auto, Habitation et VTC avec tableau de bord, devis, import/export Excel, paramètres SMTP et gestion des utilisateurs avec droits d'accès (RBAC).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@media print {
+  body {
+    background-color: white !important;
+    color: black !important;
+  }
+
+  /* Hide everything outside the printable quote modal when printing */
+  body > *:not(#root) {
+    display: none !important;
+  }
+
+  /* When printing, hide background backdrop overlays and fixed position containers */
+  .fixed.inset-0.bg-slate-950\/80 {
+    position: static !important;
+    background: transparent !important;
+    backdrop-filter: none !important;
+    padding: 0 !important;
+  }
+
+  /* Make the printable content span normally without scrolling */
+  #printable-quote {
+    overflow: visible !important;
+    max-height: none !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+  }
+
+  /* Hide modal header controls and buttons during print */
+  .no-print, button, .print-hide {
+    display: none !important;
+  }
+}
+
