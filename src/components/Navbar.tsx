@@ -1,10 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   LayoutDashboard, 
   Users, 
   Settings, 
-  Plus, 
-  FileSpreadsheet, 
   ShieldCheck, 
   Bell,
   Clock,
@@ -21,19 +19,36 @@ import {
   Check,
   Lock,
   Key,
-  LogOut
+  LogOut,
+  Calendar,
+  Type,
+  Sparkles,
+  Cloud,
+  CloudOff,
+  RefreshCw,
+  Volume2,
+  VolumeX,
+  Sliders
 } from 'lucide-react';
-import { CabinetInfo, Lead, User } from '../types/crm';
+import { CabinetInfo, Lead, User, getUserDisplayName } from '../types/crm';
 import {
   isNotificationSupported,
   getNotificationPermission,
   requestNotificationPermission,
-  isInIframe
+  isInIframe,
+  isStandaloneApp,
+  isChatSoundEnabled,
+  setChatSoundEnabled,
+  testChatNotification
 } from '../utils/notifications';
+import { getAccessibleReminders } from '../utils/permissions';
+import { AvatarCreatorModal } from './AvatarCreatorModal';
+import { PWAInstallButton } from './PWAInstallButton';
+import { NotificationSettingsModal } from './NotificationSettingsModal';
 
 interface NavbarProps {
-  currentTab: 'dashboard' | 'leads' | 'settings' | 'users' | 'chat';
-  setCurrentTab: (tab: 'dashboard' | 'leads' | 'settings' | 'users' | 'chat') => void;
+  currentTab: 'dashboard' | 'leads' | 'calendar' | 'settings' | 'users' | 'chat' | 'activity-tracking';
+  setCurrentTab: (tab: 'dashboard' | 'leads' | 'calendar' | 'settings' | 'users' | 'chat' | 'activity-tracking') => void;
   onOpenNewLeadModal: () => void;
   onOpenImportModal: () => void;
   cabinetInfo: CabinetInfo;
@@ -42,9 +57,18 @@ interface NavbarProps {
   leads?: Lead[];
   onSelectLead?: (lead: Lead) => void;
   onCompleteReminder?: (leadId: string) => void;
+  onCancelReminder?: (leadId: string) => void;
   users?: User[];
   currentUser?: User;
   onLogout?: () => void;
+  onSaveUser?: (user: User) => void;
+  firebaseUser?: any;
+  isCloudConnected?: boolean;
+  syncStatus?: 'idle' | 'syncing' | 'synced' | 'error';
+  onConnectGoogle?: () => void;
+  onDisconnectGoogle?: () => void;
+  trackerSlot?: React.ReactNode;
+  onOpenQuickSearch?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -58,18 +82,58 @@ export const Navbar: React.FC<NavbarProps> = ({
   leads = [],
   onSelectLead,
   onCompleteReminder,
+  onCancelReminder,
   users = [],
   currentUser,
-  onLogout
+  onLogout,
+  onSaveUser,
+  firebaseUser,
+  isCloudConnected = false,
+  syncStatus = 'idle',
+  onConnectGoogle,
+  onDisconnectGoogle,
+  trackerSlot,
+  onOpenQuickSearch
 }) => {
   const [showNotifications, setShowNotifications] = useState(false);
   const [showUserMenu, setShowUserMenu] = useState(false);
+  const [showFontSizeMenu, setShowFontSizeMenu] = useState(false);
   const [notifPermission, setNotifPermission] = useState<NotificationPermission>('default');
   const [showIframeModal, setShowIframeModal] = useState(false);
+  const [isAvatarModalOpen, setIsAvatarModalOpen] = useState(false);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => isChatSoundEnabled());
+  const [isTestingNotif, setIsTestingNotif] = useState(false);
+  const [showNotifSettingsModal, setShowNotifSettingsModal] = useState(false);
+
+  const [fontSize, setFontSize] = useState<'compact' | 'minimized' | 'standard'>(() => {
+    return (localStorage.getItem('crm_font_size') as any) || 'minimized';
+  });
 
   useEffect(() => {
     setNotifPermission(getNotificationPermission());
+    const saved = (localStorage.getItem('crm_font_size') as any) || 'minimized';
+    document.documentElement.setAttribute('data-font-size', saved);
   }, []);
+
+  const handleToggleSound = () => {
+    const next = !soundEnabled;
+    setSoundEnabled(next);
+    setChatSoundEnabled(next);
+  };
+
+  const handleTestChatAndSound = () => {
+    setIsTestingNotif(true);
+    testChatNotification(() => {
+      setCurrentTab('chat');
+    });
+    setTimeout(() => setIsTestingNotif(false), 2500);
+  };
+
+  const handleSetFontSize = (size: 'compact' | 'minimized' | 'standard') => {
+    setFontSize(size);
+    localStorage.setItem('crm_font_size', size);
+    document.documentElement.setAttribute('data-font-size', size);
+  };
 
   const handleEnableWindowsNotifications = async () => {
     // If inside an iframe, browsers block Notification.requestPermission()
@@ -85,19 +149,21 @@ export const Navbar: React.FC<NavbarProps> = ({
     }
   };
 
-  const currentDateFormatted = new Date().toLocaleDateString('fr-FR', {
-    weekday: 'long',
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric'
-  });
+  // Format DD/MM/YYYY en chiffres uniquement à côté du logo (ex: 14/09/2026)
+  const now = new Date();
+  const dayStr = String(now.getDate()).padStart(2, '0');
+  const monthNumStr = String(now.getMonth() + 1).padStart(2, '0');
+  const yearStr = now.getFullYear();
+  const currentDateFormatted = `${dayStr}/${monthNumStr}/${yearStr}`;
 
   const todayStr = new Date().toISOString().split('T')[0];
 
-  // Scheduled Reminders list
-  const scheduledReminders = leads.filter(
-    (l) => l.prochaineActionDate && l.status !== 'GAGNE' && l.status !== 'PERDU'
-  ).sort((a, b) => (a.prochaineActionDate || '').localeCompare(b.prochaineActionDate || ''));
+  // Scheduled Reminders list (strictly accessible to currentUser)
+  const scheduledReminders = useMemo(() => {
+    return getAccessibleReminders(leads, currentUser).sort((a, b) =>
+      (a.prochaineActionDate || '').localeCompare(b.prochaineActionDate || '')
+    );
+  }, [leads, currentUser]);
 
   const overdueCount = scheduledReminders.filter(l => (l.prochaineActionDate || '') < todayStr).length;
 
@@ -114,7 +180,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   return (
     <div className="bg-slate-900 border-b border-slate-800 text-white sticky top-0 z-30 shadow-md">
       {/* Top Header */}
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div className="w-full px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
         
         {/* Brand & Cabinet Logo */}
         <div className="flex items-center space-x-3 cursor-pointer" onClick={() => setCurrentTab('dashboard')}>
@@ -130,8 +196,8 @@ export const Navbar: React.FC<NavbarProps> = ({
               />
             </div>
           ) : (
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center text-white font-bold shadow-lg shadow-blue-500/20">
-              <ShieldCheck className="w-6 h-6" />
+            <div className="w-10 h-10 rounded-full bg-gradient-to-tr from-blue-700 via-blue-600 to-indigo-600 flex items-center justify-center text-white font-black shadow-lg shadow-blue-500/30 border-2 border-sky-400/60 shrink-0">
+              <span className="text-[11px] tracking-tight font-black">CRM<span className="text-emerald-400 text-xs">+</span></span>
             </div>
           )}
 
@@ -139,7 +205,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             <h1 className="font-bold text-lg text-slate-100 tracking-tight leading-none">
               {cabinetInfo.nomCabinet || 'Cabinet Assurance'}
             </h1>
-            <p className="text-xs text-slate-300 mt-1 capitalize">
+            <p className="text-xs text-slate-300 mt-1 font-semibold tracking-wide">
               {currentDateFormatted}
             </p>
           </div>
@@ -168,10 +234,29 @@ export const Navbar: React.FC<NavbarProps> = ({
             }`}
           >
             <Users className="w-4 h-4" />
-            <span>Gestion des Leads</span>
+            <span>Leads</span>
             {pendingActionsCount > 0 && (
               <span className="bg-amber-500 text-slate-950 text-[10px] font-bold px-1.5 py-0.2 rounded-full">
                 {pendingActionsCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => setCurrentTab('calendar')}
+            className={`flex items-center space-x-2 px-3.5 py-2 rounded-lg text-xs font-medium transition-all relative cursor-pointer ${
+              currentTab === 'calendar'
+                ? 'bg-blue-600 text-white shadow-md shadow-blue-600/30 font-bold'
+                : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Calendar className="w-4 h-4" />
+            <span>Calendrier & Rappels</span>
+            {scheduledReminders.length > 0 && (
+              <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded-full ${
+                overdueCount > 0 ? 'bg-red-500 text-white animate-pulse' : 'bg-amber-500 text-slate-950'
+              }`}>
+                {scheduledReminders.length}
               </span>
             )}
           </button>
@@ -193,23 +278,45 @@ export const Navbar: React.FC<NavbarProps> = ({
             )}
           </button>
 
-          {currentUser?.role === 'ADMIN' && (
+          {/* Suivi des Agents (Pour Admin, Directeur et Responsables d'équipe) */}
+          {(currentUser?.role === 'ADMIN' ||
+            currentUser?.role === 'DIRECTEUR_PRODUCTION' ||
+            currentUser?.role === 'RESPONSABLE_EQUIPE' ||
+            currentUser?.role === 'MANAGER') && (
             <button
-              onClick={() => setCurrentTab('settings')}
+              onClick={() => setCurrentTab('activity-tracking')}
               className={`flex items-center space-x-2 px-3.5 py-2 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-                currentTab === 'settings' || currentTab === 'users'
+                currentTab === 'activity-tracking'
                   ? 'bg-blue-600 text-white shadow-md shadow-blue-600/30 font-bold'
                   : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
               }`}
             >
+              <Clock className="w-4 h-4 text-amber-400" />
+              <span>Suivi Présence</span>
+            </button>
+          )}
+
+          {currentUser?.role === 'ADMIN' && (
+            <button
+              onClick={() => setCurrentTab('settings')}
+              className={`p-2 rounded-xl text-xs font-medium transition-all cursor-pointer ${
+                currentTab === 'settings' || currentTab === 'users'
+                  ? 'bg-blue-600 text-white shadow-md shadow-blue-600/30'
+                  : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
+              }`}
+              title="Paramètres du Cabinet"
+              aria-label="Paramètres"
+            >
               <Settings className="w-4 h-4" />
-              <span>Paramètres</span>
             </button>
           )}
         </nav>
 
         {/* Action, Notifications & User Switcher */}
         <div className="flex items-center space-x-2">
+
+          {/* Tracker Slot (Status En ligne / Pauses / Compteur) */}
+          {trackerSlot}
 
           {/* User Profile Switcher */}
           {currentUser && (
@@ -220,19 +327,21 @@ export const Navbar: React.FC<NavbarProps> = ({
                   setShowNotifications(false);
                 }}
                 className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700/80 border border-slate-700 rounded-xl flex items-center gap-2 transition cursor-pointer"
-                title="Changer d'utilisateur / Profil actif"
+                title="Mon Profil / Compte actif"
               >
                 <img
                   src={
                     currentUser.avatarUrl ||
-                    `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.prenom + ' ' + currentUser.nom)}&background=0284c7&color=fff`
+                    `https://ui-avatars.com/api/?name=${encodeURIComponent(getUserDisplayName(currentUser))}&background=0284c7&color=fff`
                   }
-                  alt={currentUser.prenom}
+                  alt={getUserDisplayName(currentUser)}
                   className="w-7 h-7 rounded-lg object-cover border border-slate-600 shrink-0"
                 />
                 <div className="text-left hidden sm:block">
-                  <p className="text-xs font-bold leading-none text-slate-100">{currentUser.prenom} {currentUser.nom}</p>
-                  <p className="text-[10px] text-slate-400 font-medium leading-tight mt-0.5">{currentUser.role}</p>
+                  <p className="text-xs font-bold leading-none text-slate-100">{getUserDisplayName(currentUser)}</p>
+                  <p className="text-[10px] text-slate-400 font-medium leading-tight mt-0.5">
+                    {currentUser.role === 'AGENT_COMMERCIAL' ? 'Agent Commercial' : currentUser.role}
+                  </p>
                 </div>
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400 ml-1" />
               </button>
@@ -243,21 +352,48 @@ export const Navbar: React.FC<NavbarProps> = ({
                   <div className="p-4 bg-slate-900 text-white space-y-2">
                     <p className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Compte Connecté</p>
                     <div className="flex items-center gap-3">
-                      <img
-                        src={
-                          currentUser.avatarUrl ||
-                          `https://ui-avatars.com/api/?name=${encodeURIComponent(currentUser.prenom + ' ' + currentUser.nom)}&background=0284c7&color=fff`
-                        }
-                        alt={currentUser.prenom}
-                        className="w-10 h-10 rounded-xl object-cover border border-slate-700 shrink-0"
-                      />
-                      <div>
-                        <p className="font-bold text-sm text-white">{currentUser.prenom} {currentUser.nom}</p>
+                      <div
+                        className="relative group cursor-pointer shrink-0"
+                        onClick={() => {
+                          setIsAvatarModalOpen(true);
+                          setShowUserMenu(false);
+                        }}
+                        title="Cliquer pour modifier votre avatar / photo"
+                      >
+                        <img
+                          src={
+                            currentUser.avatarUrl ||
+                            `https://ui-avatars.com/api/?name=${encodeURIComponent(getUserDisplayName(currentUser))}&background=0284c7&color=fff`
+                          }
+                          alt={getUserDisplayName(currentUser)}
+                          className="w-11 h-11 rounded-xl object-cover border border-slate-700 transition group-hover:opacity-85"
+                        />
+                        <div className="absolute inset-0 bg-indigo-900/60 rounded-xl opacity-0 group-hover:opacity-100 flex items-center justify-center transition text-white">
+                          <Sparkles className="w-4 h-4 text-indigo-200" />
+                        </div>
+                      </div>
+                      <div className="min-w-0">
+                        <p className="font-bold text-sm text-white truncate">{getUserDisplayName(currentUser)}</p>
                         <span className={`inline-block text-[9px] font-bold px-2 py-0.5 rounded border mt-0.5 ${getRoleColorClass(currentUser.role)}`}>
                           {currentUser.role}
                         </span>
                       </div>
                     </div>
+                  </div>
+
+                  {/* Bouton direct de personnalisation d'avatar */}
+                  <div className="p-2.5 bg-indigo-50/70 border-b border-indigo-100">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsAvatarModalOpen(true);
+                        setShowUserMenu(false);
+                      }}
+                      className="w-full py-2 px-3 bg-white hover:bg-indigo-600 text-indigo-700 hover:text-white border border-indigo-200 hover:border-indigo-600 text-xs font-bold rounded-xl transition flex items-center justify-center gap-2 cursor-pointer shadow-2xs group"
+                    >
+                      <Sparkles className="w-3.5 h-3.5 text-indigo-600 group-hover:text-white transition" />
+                      <span>Personnaliser mon avatar / photo</span>
+                    </button>
                   </div>
 
                   <div className="p-3 space-y-2 text-xs text-slate-600 border-b border-slate-100">
@@ -320,6 +456,83 @@ export const Navbar: React.FC<NavbarProps> = ({
             </div>
           )}
 
+          {/* Bouton d'Installation & Déploiement PWA (Réservé au compte Administrateur) */}
+          {currentUser?.role === 'ADMIN' && (
+            <PWAInstallButton
+              currentUser={currentUser}
+              users={users}
+              cabinetInfo={cabinetInfo}
+            />
+          )}
+
+          {/* Contrôle Taille de Police / Densité */}
+          <div className="relative">
+            <button
+              onClick={() => {
+                setShowFontSizeMenu(!showFontSizeMenu);
+                setShowNotifications(false);
+                setShowUserMenu(false);
+              }}
+              className={`p-2 rounded-xl border transition flex items-center justify-center cursor-pointer ${
+                showFontSizeMenu
+                  ? 'bg-blue-600 text-white border-blue-500'
+                  : 'bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border-slate-700'
+              }`}
+              title={`Taille de police actuelle : ${fontSize === 'compact' ? 'Très compacte' : fontSize === 'minimized' ? 'Minimisée' : 'Standard'} (Cliquer pour ajuster)`}
+              aria-label="Taille de police"
+            >
+              <Type className="w-4 h-4 text-blue-400" />
+            </button>
+
+            {showFontSizeMenu && (
+              <div className="absolute right-0 mt-2 w-52 bg-white text-slate-900 rounded-2xl shadow-2xl border border-slate-200 p-2 z-50 animate-in fade-in slide-in-from-top-2">
+                <div className="px-2 py-1.5 border-b border-slate-100 mb-1">
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Taille des polices</p>
+                  <p className="text-[11px] text-slate-500 font-medium">Réduction appliquée au CRM</p>
+                </div>
+
+                <button
+                  onClick={() => { handleSetFontSize('compact'); setShowFontSizeMenu(false); }}
+                  className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold flex items-center justify-between transition cursor-pointer ${
+                    fontSize === 'compact' ? 'bg-blue-50 text-blue-700 font-bold' : 'hover:bg-slate-100 text-slate-700'
+                  }`}
+                >
+                  <div>
+                    <span className="block font-bold">Très compacte</span>
+                    <span className="text-[10px] text-slate-400 font-normal">Ultra dense (12.5px)</span>
+                  </div>
+                  {fontSize === 'compact' && <Check className="w-4 h-4 text-blue-600 shrink-0" />}
+                </button>
+
+                <button
+                  onClick={() => { handleSetFontSize('minimized'); setShowFontSizeMenu(false); }}
+                  className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold flex items-center justify-between transition cursor-pointer mt-1 ${
+                    fontSize === 'minimized' ? 'bg-blue-50 text-blue-700 font-bold' : 'hover:bg-slate-100 text-slate-700'
+                  }`}
+                >
+                  <div>
+                    <span className="block font-bold">Minimisée ★</span>
+                    <span className="text-[10px] text-slate-400 font-normal">Recommandée (13.5px)</span>
+                  </div>
+                  {fontSize === 'minimized' && <Check className="w-4 h-4 text-blue-600 shrink-0" />}
+                </button>
+
+                <button
+                  onClick={() => { handleSetFontSize('standard'); setShowFontSizeMenu(false); }}
+                  className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold flex items-center justify-between transition cursor-pointer mt-1 ${
+                    fontSize === 'standard' ? 'bg-blue-50 text-blue-700 font-bold' : 'hover:bg-slate-100 text-slate-700'
+                  }`}
+                >
+                  <div>
+                    <span className="block font-bold">Standard</span>
+                    <span className="text-[10px] text-slate-400 font-normal">Taille normale (15px)</span>
+                  </div>
+                  {fontSize === 'standard' && <Check className="w-4 h-4 text-blue-600 shrink-0" />}
+                </button>
+              </div>
+            )}
+          </div>
+
           {/* System Notification Bell */}
           <div className="relative">
             <button
@@ -353,39 +566,87 @@ export const Navbar: React.FC<NavbarProps> = ({
                   </button>
                 </div>
 
-                {/* Windows Desktop Popup Banner */}
-                <div className="p-3 bg-indigo-900/10 border-b border-indigo-100 flex items-center justify-between gap-2">
-                  <div className="flex items-center space-x-2">
-                    <div className="p-1.5 bg-indigo-600 text-white rounded-lg shrink-0">
-                      <Monitor className="w-4 h-4" />
+                {/* Windows Desktop Popup & Sound Controls Banner */}
+                <div className="p-3 bg-indigo-900/10 border-b border-indigo-100 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center space-x-2">
+                      <div className="p-1.5 bg-indigo-600 text-white rounded-lg shrink-0">
+                        <Monitor className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <p className="text-[11px] font-bold text-indigo-950 flex items-center gap-1">
+                          Notifications Bureau & Alertes
+                        </p>
+                        <p className="text-[10px] text-slate-500 leading-tight">
+                          {notifPermission === 'granted'
+                            ? 'Popups actifs (Rappels & Messages chat)'
+                            : 'Alerte popup quand vous êtes sur une autre page'}
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      <p className="text-[11px] font-bold text-indigo-950 flex items-center gap-1">
-                        Notifications Windows / Bureau
-                      </p>
-                      <p className="text-[10px] text-slate-500 leading-tight">
-                        {notifPermission === 'granted'
-                          ? 'Popups actifs lorsque vous êtes hors du CRM'
-                          : 'Alerte popup quand vous êtes sur une autre page'}
-                      </p>
+
+                    <div className="shrink-0">
+                      {notifPermission === 'granted' ? (
+                        <span className="px-2.5 py-1 bg-emerald-100 text-emerald-800 text-[10px] font-bold rounded-lg border border-emerald-300 flex items-center gap-1">
+                          <Check className="w-3 h-3 text-emerald-600" />
+                          <span>Actif</span>
+                        </span>
+                      ) : (
+                        <button
+                          onClick={handleEnableWindowsNotifications}
+                          className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold rounded-lg transition flex items-center gap-1 cursor-pointer shadow-xs"
+                        >
+                          <Bell className="w-3 h-3 text-emerald-100" />
+                          <span>Activer</span>
+                        </button>
+                      )}
                     </div>
                   </div>
 
-                  <div className="shrink-0">
-                    {notifPermission === 'granted' ? (
-                      <span className="px-2.5 py-1 bg-emerald-100 text-emerald-800 text-[10px] font-bold rounded-lg border border-emerald-300 flex items-center gap-1">
-                        <Check className="w-3 h-3 text-emerald-600" />
-                        <span>Actif</span>
-                      </span>
-                    ) : (
-                      <button
-                        onClick={handleEnableWindowsNotifications}
-                        className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold rounded-lg transition flex items-center gap-1 cursor-pointer shadow-xs"
-                      >
-                        <Bell className="w-3 h-3 text-emerald-100" />
-                        <span>Activer</span>
-                      </button>
-                    )}
+                  {/* Sound Toggle & Test Row */}
+                  <div className="flex items-center gap-2 pt-1 border-t border-indigo-100/60">
+                    <button
+                      onClick={handleToggleSound}
+                      className={`flex-1 px-2 py-1 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer border ${
+                        soundEnabled
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-300 hover:bg-emerald-100'
+                          : 'bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200'
+                      }`}
+                      title="Activer ou couper le son des alertes et messages"
+                    >
+                      {soundEnabled ? (
+                        <>
+                          <Volume2 className="w-3 h-3 text-emerald-600 shrink-0" />
+                          <span>Sonnerie Active</span>
+                        </>
+                      ) : (
+                        <>
+                          <VolumeX className="w-3 h-3 text-slate-500 shrink-0" />
+                          <span>Sonnerie Coupée</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={handleTestChatAndSound}
+                      disabled={isTestingNotif}
+                      className="flex-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-[10px] font-bold transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                      title="Tester immédiatement la sonnerie et la notification bureau"
+                    >
+                      <Sparkles className="w-3 h-3 text-amber-300" />
+                      <span>{isTestingNotif ? 'Envoi...' : 'Tester le son'}</span>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setShowNotifications(false);
+                        setShowNotifSettingsModal(true);
+                      }}
+                      className="p-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] font-bold transition flex items-center justify-center cursor-pointer border border-slate-200"
+                      title="Ouvrir les paramètres avancés des notifications Chrome & App installée"
+                    >
+                      <Sliders className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 </div>
 
@@ -397,12 +658,12 @@ export const Navbar: React.FC<NavbarProps> = ({
                       <p className="text-[11px] text-slate-400">Toutes vos actions programmées sont à jour !</p>
                     </div>
                   ) : (
-                    scheduledReminders.map((lead) => {
+                    scheduledReminders.map((lead, idx) => {
                       const isOverdue = (lead.prochaineActionDate || '') < todayStr;
                       const isToday = (lead.prochaineActionDate || '') === todayStr;
 
                       return (
-                        <div key={lead.id} className="p-3 hover:bg-slate-50 transition rounded-xl space-y-1.5">
+                        <div key={`reminder-${lead.id}-${idx}`} className="p-3 hover:bg-slate-50 transition rounded-xl space-y-1.5">
                           <div className="flex items-center justify-between">
                             <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded-full ${
                               isOverdue ? 'bg-red-100 text-red-800 border border-red-200' :
@@ -443,9 +704,21 @@ export const Navbar: React.FC<NavbarProps> = ({
                                     onCompleteReminder(lead.id);
                                   }}
                                   className="px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-[10px] font-bold rounded-md border border-emerald-200 transition cursor-pointer"
-                                  title="Marquer comme traité"
+                                  title="Marquer comme traité (Fait)"
                                 >
                                   ✓ Fait
+                                </button>
+                              )}
+
+                              {onCancelReminder && (
+                                <button
+                                  onClick={() => {
+                                    onCancelReminder(lead.id);
+                                  }}
+                                  className="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 text-[10px] font-bold rounded-md border border-rose-200 transition cursor-pointer"
+                                  title="Annuler cette action"
+                                >
+                                  ✕ Annuler
                                 </button>
                               )}
 
@@ -468,30 +741,24 @@ export const Navbar: React.FC<NavbarProps> = ({
                     })
                   )}
                 </div>
+
+                {scheduledReminders.length > 0 && (
+                  <div className="p-2.5 bg-slate-50 border-t border-slate-200">
+                    <button
+                      onClick={() => {
+                        setCurrentTab('calendar');
+                        setShowNotifications(false);
+                      }}
+                      className="w-full py-2 px-3 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+                    >
+                      <Calendar className="w-3.5 h-3.5" />
+                      <span>Ouvrir le Calendrier & Rappels complet</span>
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>
-
-          {currentUser && (currentUser.role === 'ADMIN' || currentUser.role === 'DIRECTEUR_PRODUCTION') && (
-            <button
-              onClick={onOpenImportModal}
-              className="hidden sm:flex items-center space-x-2 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 transition cursor-pointer"
-              title="Importer des leads via fichier Excel ou CSV"
-            >
-              <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
-              <span>Import Excel</span>
-            </button>
-          )}
-
-          {currentUser?.permissions.canCreateLeads && (
-            <button
-              onClick={onOpenNewLeadModal}
-              className="flex items-center space-x-2 px-3.5 py-2 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-semibold rounded-lg shadow-lg shadow-emerald-900/30 transition transform active:scale-95 cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Nouveau Lead</span>
-            </button>
-          )}
         </div>
       </div>
 
@@ -520,6 +787,48 @@ export const Navbar: React.FC<NavbarProps> = ({
             </span>
           )}
         </button>
+        <button
+          onClick={() => setCurrentTab('calendar')}
+          className={`flex flex-col items-center py-1 px-3 rounded-lg text-xs font-medium relative ${
+            currentTab === 'calendar' ? 'text-blue-400 font-bold' : 'text-slate-400'
+          }`}
+        >
+          <Calendar className="w-5 h-5 mb-0.5" />
+          <span>Rappels</span>
+          {scheduledReminders.length > 0 && (
+            <span className="absolute top-0 right-2 bg-amber-500 text-slate-950 text-[10px] font-bold px-1 rounded-full">
+              {scheduledReminders.length}
+            </span>
+          )}
+        </button>
+        <button
+          onClick={() => setCurrentTab('chat')}
+          className={`flex flex-col items-center py-1 px-3 rounded-lg text-xs font-medium relative ${
+            currentTab === 'chat' ? 'text-blue-400 font-bold' : 'text-slate-400'
+          }`}
+        >
+          <MessageSquare className="w-5 h-5 mb-0.5" />
+          <span>Chat</span>
+          {unreadChatCount > 0 && (
+            <span className="absolute top-0 right-2 bg-rose-500 text-white text-[10px] font-black px-1.5 py-0.2 rounded-full animate-pulse shadow-xs">
+              {unreadChatCount}
+            </span>
+          )}
+        </button>
+        {(currentUser?.role === 'ADMIN' ||
+          currentUser?.role === 'DIRECTEUR_PRODUCTION' ||
+          currentUser?.role === 'RESPONSABLE_EQUIPE' ||
+          currentUser?.role === 'MANAGER') && (
+          <button
+            onClick={() => setCurrentTab('activity-tracking')}
+            className={`flex flex-col items-center py-1 px-3 rounded-lg text-xs font-medium ${
+              currentTab === 'activity-tracking' ? 'text-blue-400 font-bold' : 'text-slate-400'
+            }`}
+          >
+            <Clock className="w-5 h-5 mb-0.5 text-amber-400" />
+            <span>Présence</span>
+          </button>
+        )}
         <button
           onClick={() => setCurrentTab('settings')}
           className={`flex flex-col items-center py-1 px-3 rounded-lg text-xs font-medium ${
@@ -575,20 +884,49 @@ export const Navbar: React.FC<NavbarProps> = ({
                 Fermer
               </button>
 
-              <button
-                onClick={() => {
-                  window.open(window.location.href, '_blank');
-                  setShowIframeModal(false);
-                }}
+              <a
+                href={window.location.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => setShowIframeModal(false)}
                 className="w-full sm:w-auto px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition flex items-center justify-center gap-2 cursor-pointer shadow-md shadow-indigo-200"
               >
                 <ExternalLink className="w-4 h-4" />
-                <span>Ouvrir le CRM dans un nouvel onglet</span>
-              </button>
+                <span>Ouvrir le CRM dans un nouvel onglet Chrome</span>
+              </a>
             </div>
           </div>
         </div>
       )}
+
+      {/* Modal Studio Avatar & Photo de Profil */}
+      {currentUser && (
+        <AvatarCreatorModal
+          isOpen={isAvatarModalOpen}
+          onClose={() => setIsAvatarModalOpen(false)}
+          currentAvatarUrl={currentUser.avatarUrl}
+          user={currentUser}
+          onSaveAvatar={(newAvatarUrl) => {
+            if (onSaveUser) {
+              onSaveUser({
+                ...currentUser,
+                avatarUrl: newAvatarUrl
+              });
+            }
+          }}
+        />
+      )}
+
+      {/* Modal Paramètres Avancés Notifications Chrome & PWA */}
+      <NotificationSettingsModal
+        isOpen={showNotifSettingsModal}
+        onClose={() => {
+          setShowNotifSettingsModal(false);
+          setNotifPermission(getNotificationPermission());
+          setSoundEnabled(isChatSoundEnabled());
+        }}
+        onOpenChat={() => setCurrentTab('chat')}
+      />
     </div>
   );
 };

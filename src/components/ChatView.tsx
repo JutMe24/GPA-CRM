@@ -21,7 +21,14 @@ import {
   User as UserIcon,
   Phone,
   Mail,
-  AlertCircle
+  AlertCircle,
+  Bell,
+  BellOff,
+  Volume2,
+  VolumeX,
+  Check,
+  ExternalLink,
+  Sliders
 } from 'lucide-react';
 import {
   User,
@@ -30,8 +37,20 @@ import {
   UserRole,
   isAdminRole,
   isResponsableRole,
-  isAgentRole
+  isAgentRole,
+  isChannelVisibleToUser
 } from '../types/crm';
+import {
+  getNotificationPermission,
+  requestNotificationPermission,
+  isChatSoundEnabled,
+  setChatSoundEnabled,
+  isChatDesktopNotifEnabled,
+  setChatDesktopNotifEnabled,
+  testChatNotification,
+  isInIframe
+} from '../utils/notifications';
+import { NotificationSettingsModal } from './NotificationSettingsModal';
 
 interface ChatViewProps {
   currentUser: User;
@@ -41,6 +60,9 @@ interface ChatViewProps {
   onSendMessage: (channelId: string, content: string, attachments?: any[]) => void;
   onCreateDirectChannel: (otherUser: User) => string;
   onToggleReaction: (messageId: string, emoji: string) => void;
+  selectedChannelId?: string;
+  onSelectChannel?: (channelId: string) => void;
+  unreadCountByChannel?: Record<string, number>;
 }
 
 export const ChatView: React.FC<ChatViewProps> = ({
@@ -50,9 +72,12 @@ export const ChatView: React.FC<ChatViewProps> = ({
   messages,
   onSendMessage,
   onCreateDirectChannel,
-  onToggleReaction
+  onToggleReaction,
+  selectedChannelId,
+  onSelectChannel,
+  unreadCountByChannel = {}
 }) => {
-  const [activeChannelId, setActiveChannelId] = useState<string>('');
+  const [activeChannelId, setActiveChannelId] = useState<string>(selectedChannelId || '');
   const [inputText, setInputText] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [isNewChatModalOpen, setIsNewChatModalOpen] = useState(false);
@@ -63,20 +88,58 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Filter channels based on user role and permissions
-  const visibleChannels = channels.filter((channel) => {
-    if (channel.type === 'GROUP') {
-      // Admin sees all groups
-      if (isAdminRole(currentUser.role)) return true;
-      // Responsable sees group for their team or if participant
-      if (channel.participantIds.includes(currentUser.id)) return true;
-      if (currentUser.equipe && channel.equipe === currentUser.equipe) return true;
-      return false;
-    } else {
-      // Direct channel: must include current user
-      return channel.participantIds.includes(currentUser.id);
+  // Notification and Sound Controls State
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission>(() => getNotificationPermission());
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => isChatSoundEnabled());
+  const [desktopNotifEnabled, setDesktopNotifEnabled] = useState<boolean>(() => isChatDesktopNotifEnabled());
+  const [isTestingFeedback, setIsTestingFeedback] = useState(false);
+  const [showIframeModal, setShowIframeModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+
+  useEffect(() => {
+    setNotifPermission(getNotificationPermission());
+  }, []);
+
+  // Sync external channel selection
+  useEffect(() => {
+    if (selectedChannelId && selectedChannelId !== activeChannelId) {
+      setActiveChannelId(selectedChannelId);
     }
-  });
+  }, [selectedChannelId]);
+
+  const handleToggleSound = () => {
+    const next = !soundEnabled;
+    setSoundEnabled(next);
+    setChatSoundEnabled(next);
+  };
+
+  const handleToggleDesktopNotif = () => {
+    const next = !desktopNotifEnabled;
+    setDesktopNotifEnabled(next);
+    setChatDesktopNotifEnabled(next);
+  };
+
+  const handleEnableDesktopNotifications = async () => {
+    if (isInIframe()) {
+      setShowIframeModal(true);
+      return;
+    }
+    const perm = await requestNotificationPermission();
+    setNotifPermission(perm);
+  };
+
+  const handleTestChatNotification = () => {
+    setIsTestingFeedback(true);
+    testChatNotification(() => {
+      // Focus chat channel callback
+    });
+    setTimeout(() => {
+      setIsTestingFeedback(false);
+    }, 2500);
+  };
+
+  // Filter channels based on user role, team and participant permissions
+  const visibleChannels = channels.filter((channel) => isChannelVisibleToUser(channel, currentUser));
 
   // Set default active channel if none selected
   useEffect(() => {
@@ -193,7 +256,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     const otherId = channel.participantIds.find((id) => id !== currentUser.id);
     const otherUser = users.find((u) => u.id === otherId);
     if (otherUser) {
-      return `${otherUser.prenom} ${otherUser.nom}`;
+      return otherUser.pseudo || `${otherUser.prenom} ${otherUser.nom}`;
     }
     return channel.name;
   };
@@ -205,7 +268,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     const otherId = channel.participantIds.find((id) => id !== currentUser.id);
     const otherUser = users.find((u) => u.id === otherId);
     if (otherUser) {
-      return `${otherUser.role} • ${otherUser.equipe || 'Horizon Courtage'}`;
+      return `${otherUser.role} • ${otherUser.equipe || 'Cabinet'}`;
     }
     return 'Chat Direct';
   };
@@ -287,6 +350,117 @@ export const ChatView: React.FC<ChatViewProps> = ({
           </div>
         </div>
 
+        {/* Notifications & Sound Controls Card */}
+        <div className="p-3 bg-slate-900 text-white border-b border-slate-800 space-y-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-1.5">
+              <Bell className="w-3.5 h-3.5 text-blue-400" />
+              <span className="text-[11px] font-bold tracking-wide uppercase text-slate-300">
+                Alertes & Sons
+              </span>
+            </div>
+            
+            <div className="flex items-center gap-1.5">
+              {notifPermission === 'granted' ? (
+                <span className="px-2 py-0.5 bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold rounded-full flex items-center gap-1">
+                  <Check className="w-2.5 h-2.5" />
+                  <span>Bureau Actif</span>
+                </span>
+              ) : (
+                <button
+                  onClick={handleEnableDesktopNotifications}
+                  className="px-2 py-0.5 bg-blue-500 hover:bg-blue-600 text-white text-[10px] font-bold rounded-full transition flex items-center gap-1 cursor-pointer shadow-xs"
+                  title="Autoriser les notifications de bureau Windows/Navigateur"
+                >
+                  <Bell className="w-2.5 h-2.5" />
+                  <span>Autoriser</span>
+                </button>
+              )}
+
+              <button
+                onClick={() => setShowSettingsModal(true)}
+                className="p-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition cursor-pointer border border-slate-700"
+                title="Personnaliser les sonneries, le volume et les notifications Chrome / PWA"
+              >
+                <Sliders className="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-1.5">
+            {/* Son Toggle */}
+            <button
+              onClick={handleToggleSound}
+              className={`px-2 py-1.5 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer border ${
+                soundEnabled
+                  ? 'bg-slate-800 text-emerald-300 border-emerald-500/40 hover:bg-slate-700'
+                  : 'bg-slate-800/60 text-slate-400 border-slate-700 hover:bg-slate-800'
+              }`}
+              title={soundEnabled ? 'Sonnerie activée (chime mélodieux)' : 'Sonnerie coupée'}
+            >
+              {soundEnabled ? (
+                <>
+                  <Volume2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                  <span className="truncate">Sonnerie ON</span>
+                </>
+              ) : (
+                <>
+                  <VolumeX className="w-3 h-3 text-slate-400 shrink-0" />
+                  <span className="truncate">Sonnerie OFF</span>
+                </>
+              )}
+            </button>
+
+            {/* Popups Bureau Toggle */}
+            <button
+              onClick={notifPermission === 'granted' ? handleToggleDesktopNotif : handleEnableDesktopNotifications}
+              className={`px-2 py-1.5 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 transition cursor-pointer border ${
+                desktopNotifEnabled && notifPermission === 'granted'
+                  ? 'bg-slate-800 text-blue-300 border-blue-500/40 hover:bg-slate-700'
+                  : 'bg-slate-800/60 text-slate-400 border-slate-700 hover:bg-slate-800'
+              }`}
+              title={
+                notifPermission !== 'granted'
+                  ? 'Cliquez pour autoriser les popups de bureau'
+                  : desktopNotifEnabled
+                  ? 'Popups de bureau activés'
+                  : 'Popups de bureau désactivés'
+              }
+            >
+              {desktopNotifEnabled && notifPermission === 'granted' ? (
+                <>
+                  <Bell className="w-3 h-3 text-blue-400 shrink-0" />
+                  <span className="truncate">Bureau ON</span>
+                </>
+              ) : (
+                <>
+                  <BellOff className="w-3 h-3 text-slate-400 shrink-0" />
+                  <span className="truncate">Bureau OFF</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Quick Test Button */}
+          <button
+            onClick={handleTestChatNotification}
+            disabled={isTestingFeedback}
+            className="w-full py-1.5 px-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-lg text-[10px] font-bold transition flex items-center justify-center gap-1.5 cursor-pointer shadow-xs"
+          >
+            {isTestingFeedback ? (
+              <>
+                <Sparkles className="w-3 h-3 text-amber-300 animate-spin" />
+                <span>Test en cours (Sonnerie + Popup)...</span>
+              </>
+            ) : (
+              <>
+                <Volume2 className="w-3 h-3 text-blue-200" />
+                <span>Tester la sonnerie & la notification bureau</span>
+              </>
+            )}
+          </button>
+        </div>
+
         {/* Role Rules Info Banner */}
         <div className="p-2.5 bg-blue-50/80 border-b border-blue-100 flex items-start gap-2 text-[11px] text-blue-900">
           <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
@@ -322,10 +496,14 @@ export const ChatView: React.FC<ChatViewProps> = ({
             .filter((c) => c.name.toLowerCase().includes(searchQuery.toLowerCase()))
             .map((channel) => {
               const isActive = channel.id === activeChannelId;
+              const unread = unreadCountByChannel[channel.id] || 0;
               return (
                 <button
                   key={channel.id}
-                  onClick={() => setActiveChannelId(channel.id)}
+                  onClick={() => {
+                    setActiveChannelId(channel.id);
+                    onSelectChannel?.(channel.id);
+                  }}
                   className={`w-full text-left p-2.5 rounded-xl transition flex items-center gap-3 cursor-pointer ${
                     isActive
                       ? 'bg-blue-600 text-white shadow-md shadow-blue-500/20 font-medium'
@@ -338,6 +516,11 @@ export const ChatView: React.FC<ChatViewProps> = ({
                       <span className={`text-xs font-bold truncate ${isActive ? 'text-white' : 'text-slate-900'}`}>
                         {channel.name}
                       </span>
+                      {unread > 0 && !isActive && (
+                        <span className="bg-rose-500 text-white text-[10px] font-black px-1.5 py-0.2 rounded-full shrink-0 shadow-xs animate-pulse">
+                          {unread}
+                        </span>
+                      )}
                     </div>
                     <p className={`text-[11px] truncate mt-0.5 ${isActive ? 'text-blue-100' : 'text-slate-500'}`}>
                       {channel.lastMessage || channel.description || 'Discussions de groupe'}
@@ -364,11 +547,15 @@ export const ChatView: React.FC<ChatViewProps> = ({
               const isActive = channel.id === activeChannelId;
               const title = getChannelDisplayTitle(channel);
               const subtitle = getChannelDisplaySubtitle(channel);
+              const unread = unreadCountByChannel[channel.id] || 0;
 
               return (
                 <button
                   key={channel.id}
-                  onClick={() => setActiveChannelId(channel.id)}
+                  onClick={() => {
+                    setActiveChannelId(channel.id);
+                    onSelectChannel?.(channel.id);
+                  }}
                   className={`w-full text-left p-2.5 rounded-xl transition flex items-center gap-3 cursor-pointer ${
                     isActive
                       ? 'bg-blue-600 text-white shadow-md shadow-blue-500/20 font-medium'
@@ -381,6 +568,11 @@ export const ChatView: React.FC<ChatViewProps> = ({
                       <span className={`text-xs font-bold truncate ${isActive ? 'text-white' : 'text-slate-900'}`}>
                         {title}
                       </span>
+                      {unread > 0 && !isActive && (
+                        <span className="bg-rose-500 text-white text-[10px] font-black px-1.5 py-0.2 rounded-full shrink-0 shadow-xs animate-pulse">
+                          {unread}
+                        </span>
+                      )}
                     </div>
                     <p className={`text-[11px] truncate mt-0.5 ${isActive ? 'text-blue-100' : 'text-slate-500'}`}>
                       {channel.lastMessage || subtitle}
@@ -498,7 +690,12 @@ export const ChatView: React.FC<ChatViewProps> = ({
                         <div className={`max-w-[75%] space-y-1 ${isMe ? 'items-end text-right' : 'items-start text-left'}`}>
                           {/* Sender name & Role */}
                           <div className={`flex items-center gap-2 text-[11px] text-slate-500 ${isMe ? 'justify-end' : 'justify-start'}`}>
-                            <span className="font-bold text-slate-800">{msg.senderName}</span>
+                            <span className="font-bold text-slate-800">
+                              {(() => {
+                                const senderUser = users.find((u) => u.id === msg.senderId);
+                                return senderUser?.pseudo || msg.senderName;
+                              })()}
+                            </span>
                             {getRoleBadge(msg.senderRole)}
                             <span className="text-[10px] text-slate-400">{msg.timestamp}</span>
                           </div>
@@ -621,7 +818,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
                             />
                             <div className="min-w-0">
                               <p className="text-xs font-bold text-slate-800 truncate">
-                                {u.prenom} {u.nom}
+                                {u.pseudo || `${u.prenom} ${u.nom}`}
                               </p>
                               <p className="text-[10px] text-slate-400 truncate">{u.specialite || u.role}</p>
                             </div>
@@ -785,7 +982,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
                     />
                     <div>
                       <p className="font-bold text-xs text-slate-900 group-hover:text-blue-700">
-                        {contact.prenom} {contact.nom}
+                        {contact.pseudo || `${contact.prenom} ${contact.nom}`}
                       </p>
                       <p className="text-[10px] text-slate-500">
                         {contact.specialite || contact.equipe || contact.email}
@@ -819,6 +1016,76 @@ export const ChatView: React.FC<ChatViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* MODAL: IFRAME NOTIFICATION WARNING */}
+      {showIframeModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-md p-6 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200">
+              <div className="flex items-center space-x-2 text-indigo-600">
+                <Bell className="w-6 h-6" />
+                <h3 className="font-bold text-base">Activation des Notifications de Bureau</h3>
+              </div>
+              <button
+                onClick={() => setShowIframeModal(false)}
+                className="text-slate-400 hover:text-slate-600 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="py-4 space-y-3">
+              <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 flex items-start space-x-3 text-amber-900">
+                <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <p className="text-xs leading-relaxed">
+                  <strong>Sécurité Navigateur (Chrome / Edge) :</strong> Les autorisations de notifications popups Windows ne peuvent pas être demandées directement à l'intérieur d'un cadre de prévisualisation (iframe).
+                </p>
+              </div>
+
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Pour recevoir les messages du chat sous forme de <strong>popups Windows avec sonnerie</strong> en direct :
+              </p>
+
+              <ol className="text-xs text-slate-700 space-y-2 list-decimal list-inside font-medium bg-slate-50 p-3 rounded-xl border border-slate-200">
+                <li>Ouvrez le CRM dans un <strong>nouvel onglet indépendant</strong> (bouton ci-dessous).</li>
+                <li>Dans la messagerie, cliquez sur <strong>Autoriser Bureau</strong>.</li>
+                <li>Acceptez la demande d'autorisation de votre navigateur.</li>
+              </ol>
+            </div>
+
+            <div className="pt-2 flex flex-col sm:flex-row items-center justify-end gap-2">
+              <button
+                onClick={() => setShowIframeModal(false)}
+                className="w-full sm:w-auto px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl transition cursor-pointer"
+              >
+                Fermer
+              </button>
+
+              <a
+                href={window.location.href}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => setShowIframeModal(false)}
+                className="w-full sm:w-auto px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition flex items-center justify-center gap-2 cursor-pointer shadow-md shadow-indigo-200"
+              >
+                <ExternalLink className="w-4 h-4" />
+                <span>Ouvrir le CRM dans un nouvel onglet Chrome</span>
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Paramètres Avancés Notifications Chrome & PWA */}
+      <NotificationSettingsModal
+        isOpen={showSettingsModal}
+        onClose={() => {
+          setShowSettingsModal(false);
+          setNotifPermission(getNotificationPermission());
+          setSoundEnabled(isChatSoundEnabled());
+          setDesktopNotifEnabled(isChatDesktopNotifEnabled());
+        }}
+      />
     </div>
   );
 };

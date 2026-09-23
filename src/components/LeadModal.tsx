@@ -28,9 +28,13 @@ import {
   HabitationDetails, 
   VtcDetails,
   CabinetInfo,
-  User as UserType
+  User as UserType,
+  LeadDocument,
+  getUserDisplayName
 } from '../types/crm';
 import { generateQuoteReference } from '../utils/storage';
+import { LeadDocumentsTab } from './LeadDocumentsTab';
+import { detectLeadDuplicates, DuplicateMatch } from '../utils/duplicates';
 
 interface LeadModalProps {
   isOpen: boolean;
@@ -40,6 +44,8 @@ interface LeadModalProps {
   cabinetInfo?: CabinetInfo;
   users?: UserType[];
   currentUser?: UserType;
+  allLeads?: Lead[];
+  onSelectExistingLead?: (lead: Lead) => void;
 }
 
 const createDefaultAutoForm = (): AutoDetails => ({
@@ -61,6 +67,13 @@ const createDefaultAutoForm = (): AutoDetails => ({
   typeUtilisation: 'Trajet privé',
   proprietaireVehicule: 'Conducteur principal',
   marqueModele: '',
+  version: '',
+  energie: 'Essence',
+  puissanceFiscale: 5,
+  valeurEstimee: 0,
+  kilometrageAnnuel: '15 000–20 000',
+  statutVehicule: 'Occasion',
+  stationnementNuit: 'Parking privé',
   dejaAssure: false,
   nomDerniereCompagnie: '',
   nombreMoisAssure36Mois: 0,
@@ -79,6 +92,9 @@ const createDefaultAutoForm = (): AutoDetails => ({
   formuleSouhaitee: 'Tous Risques',
   fractionnement: 'Mensuel',
   cotisationMontant: 0,
+  cotisationTiersSimple: 0,
+  cotisationTiersEtendu: 0,
+  cotisationTousRisques: 0,
   fraisDossier: 0,
   optionsSupplementaires: []
 });
@@ -115,6 +131,9 @@ const createDefaultHabitationForm = (): HabitationDetails => ({
   formuleSouhaitee: 'Formule Confort',
   fractionnement: 'Mensuel',
   cotisationMontant: 0,
+  cotisationFormuleEco: 0,
+  cotisationFormuleConfort: 0,
+  cotisationFormuleTousRisques: 0,
   fraisDossier: 0,
   optionsSupplementaires: []
 });
@@ -140,9 +159,15 @@ const createDefaultVtcForm = (): VtcDetails => ({
   chiffreAffairesEstime: 0,
   immatriculation: '',
   marqueModele: '',
+  version: '',
   anneeVehicule: '',
   nombrePlaces: 5,
   typeMotorisation: 'Hybride',
+  puissanceFiscale: 7,
+  valeurEstimee: 0,
+  statutVehicule: 'LOA',
+  stationnementNuit: 'Parking privé',
+  kilometrageAnnuel: 'Kilométrage illimité',
   typeUsage: 'VTC Exclusif',
   proprietaireVehicule: 'Propriétaire unique',
   dejaAssure: false,
@@ -161,6 +186,9 @@ const createDefaultVtcForm = (): VtcDetails => ({
   formuleSouhaitee: 'Tous Risques VTC + RC Pro',
   fractionnement: 'Mensuel',
   cotisationMontant: 0,
+  cotisationTiersSimple: 0,
+  cotisationTiersEtendu: 0,
+  cotisationTousRisques: 0,
   fraisDossier: 0,
   franchiseMontant: 0,
   optionsSupplementaires: []
@@ -173,7 +201,9 @@ export const LeadModal: React.FC<LeadModalProps> = ({
   existingLead,
   cabinetInfo,
   users = [],
-  currentUser
+  currentUser,
+  allLeads = [],
+  onSelectExistingLead
 }) => {
   if (!isOpen) return null;
 
@@ -185,15 +215,33 @@ export const LeadModal: React.FC<LeadModalProps> = ({
   // Active Tab Index inside the form wizard
   const [activeTab, setActiveTab] = useState<number>(0);
 
+  // Documents associés au dossier
+  const [documents, setDocuments] = useState<LeadDocument[]>(existingLead?.documents || []);
+
   // Statuses & Actions options from Cabinet Config or defaults
-  const statusesOptions = cabinetInfo?.customStatuses || [
-    { id: 'NOUVEAU', label: 'Nouveau Lead' },
-    { id: 'A_CONTACTER', label: 'À Contacter' },
-    { id: 'DEVIS_ENVOYE', label: 'Devis Envoyé' },
-    { id: 'RELANCE', label: 'Relance à faire' },
-    { id: 'GAGNE', label: 'Souscrit / Gagné' },
-    { id: 'PERDU', label: 'Perdu / Rejeté' }
-  ];
+  const statusesOptions = useMemo(() => {
+    const list = cabinetInfo?.customStatuses && cabinetInfo.customStatuses.length > 0
+      ? [...cabinetInfo.customStatuses]
+      : [
+          { id: 'NOUVEAU', label: 'Nouveau Lead' },
+          { id: 'A_CONTACTER', label: 'À Contacter' },
+          { id: 'DEVIS_ENVOYE', label: 'Devis Envoyé' },
+          { id: 'RELANCE', label: 'Relance à faire' },
+          { id: 'PDG', label: 'PDG (Prise De Garantie)' },
+          { id: 'GAGNE', label: 'Souscrit / Gagné' },
+          { id: 'PERDU', label: 'Perdu / Rejeté' }
+        ];
+
+    if (!list.some((s) => s.id === 'PDG')) {
+      const gagneIdx = list.findIndex((s) => s.id === 'GAGNE');
+      if (gagneIdx !== -1) {
+        list.splice(gagneIdx, 0, { id: 'PDG', label: 'PDG (Prise De Garantie)' });
+      } else {
+        list.push({ id: 'PDG', label: 'PDG (Prise De Garantie)' });
+      }
+    }
+    return list;
+  }, [cabinetInfo?.customStatuses]);
 
   const nextActionsOptions = cabinetInfo?.customNextActions || [
     'Appel téléphonique',
@@ -206,7 +254,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
   // Common Top-level fields
   const [status, setStatus] = useState<LeadStatus>(existingLead?.status || 'NOUVEAU');
   const [qualification, setQualification] = useState<LeadQualification>(existingLead?.qualification || 'CHAUD');
-  const [assignedBroker, setAssignedBroker] = useState<string>(existingLead?.assignedBroker || (currentUser ? `${currentUser.prenom} ${currentUser.nom}` : cabinetInfo?.nomCourtierPrincipal || 'Pierre-Antoine Dupuis'));
+  const [assignedBroker, setAssignedBroker] = useState<string>(existingLead?.assignedBroker || (currentUser ? getUserDisplayName(currentUser) : cabinetInfo?.nomCourtierPrincipal || 'Tarik Cherkaoui'));
   const [equipe, setEquipe] = useState<string>(existingLead?.equipe || currentUser?.equipe || '');
   const [prochaineActionIntitule, setProchaineActionIntitule] = useState<string>(existingLead?.prochaineActionIntitule || 'Appel téléphonique');
   const [prochaineActionDate, setProchaineActionDate] = useState<string>(existingLead?.prochaineActionDate || new Date().toISOString().split('T')[0]);
@@ -254,7 +302,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
     return (
       <div>
         <label className="block text-xs font-bold text-slate-700 mb-1 flex items-center justify-between">
-          <span>Agent Commercial Attribué *</span>
+          <span>Agent Commercial Attribué</span>
           {currentUser?.role === 'RESPONSABLE_EQUIPE' && currentUser.equipe && (
             <span className="text-[10px] text-indigo-600 font-semibold">
               (Équipe: {currentUser.equipe})
@@ -267,7 +315,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
             onChange={(e) => {
               const val = e.target.value;
               setAssignedBroker(val);
-              const matched = users?.find(u => `${u.prenom} ${u.nom}` === val);
+              const matched = users?.find(u => getUserDisplayName(u) === val || `${u.prenom} ${u.nom}` === val || u.pseudo === val);
               if (matched && matched.equipe) {
                 setEquipe(matched.equipe);
               }
@@ -276,11 +324,11 @@ export const LeadModal: React.FC<LeadModalProps> = ({
             className="w-full text-xs font-bold p-2.5 rounded-lg border border-slate-300 bg-white text-slate-800 focus:ring-2 focus:ring-blue-500 cursor-pointer disabled:bg-slate-100 disabled:cursor-not-allowed"
           >
             {selectableUsers.map((u) => (
-              <option key={u.id} value={`${u.prenom} ${u.nom}`}>
-                {u.prenom} {u.nom} ({u.role === 'AGENT_COMMERCIAL' ? 'Agent Commercial' : u.role === 'RESPONSABLE_EQUIPE' ? 'Resp. Équipe' : u.role}) {u.equipe ? `— ${u.equipe}` : ''}
+              <option key={u.id} value={getUserDisplayName(u)}>
+                {getUserDisplayName(u)} ({u.role === 'AGENT_COMMERCIAL' ? 'Agent Commercial' : u.role === 'RESPONSABLE_EQUIPE' ? 'Resp. Équipe' : u.role}) {u.equipe ? `— ${u.equipe}` : ''}
               </option>
             ))}
-            {assignedBroker && !selectableUsers.some(u => `${u.prenom} ${u.nom}` === assignedBroker) && (
+            {assignedBroker && !selectableUsers.some(u => getUserDisplayName(u) === assignedBroker || `${u.prenom} ${u.nom}` === assignedBroker) && (
               <option value={assignedBroker}>{assignedBroker}</option>
             )}
           </select>
@@ -332,7 +380,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
         setLeadType(existingLead.type);
         setStatus(existingLead.status || 'NOUVEAU');
         setQualification(existingLead.qualification || 'CHAUD');
-        setAssignedBroker(existingLead.assignedBroker || existingLead.attribueA || (currentUser ? `${currentUser.prenom} ${currentUser.nom}` : cabinetInfo?.nomCourtierPrincipal || 'Pierre-Antoine Dupuis'));
+        setAssignedBroker(existingLead.assignedBroker || existingLead.attribueA || (currentUser ? getUserDisplayName(currentUser) : cabinetInfo?.nomCourtierPrincipal || 'Tarik Cherkaoui'));
         setEquipe(existingLead.equipe || currentUser?.equipe || '');
         setProchaineActionIntitule(existingLead.prochaineActionIntitule || 'Appel téléphonique');
         setProchaineActionDate(existingLead.prochaineActionDate || new Date().toISOString().split('T')[0]);
@@ -341,14 +389,15 @@ export const LeadModal: React.FC<LeadModalProps> = ({
         setAutoForm(existingLead.autoDetails || createDefaultAutoForm());
         setHabitationForm(existingLead.habitationDetails || createDefaultHabitationForm());
         setVtcForm(existingLead.vtcDetails || createDefaultVtcForm());
+        setDocuments(existingLead.documents || []);
       } else {
         // Nouveau Lead: Formulaire 100% vierge
         setLeadType('AUTO');
         setStatus('NOUVEAU');
         setQualification('CHAUD');
-        const defaultAgent = currentUser ? `${currentUser.prenom} ${currentUser.nom}` : (cabinetInfo?.nomCourtierPrincipal || 'Pierre-Antoine Dupuis');
+        const defaultAgent = currentUser ? getUserDisplayName(currentUser) : (cabinetInfo?.nomCourtierPrincipal || 'Tarik Cherkaoui');
         setAssignedBroker(defaultAgent);
-        setEquipe(currentUser?.equipe || 'Équipe Auto & Habitation');
+        setEquipe(currentUser?.equipe || 'Direction Générale');
         setProchaineActionIntitule('Appel téléphonique');
         setProchaineActionDate(new Date().toISOString().split('T')[0]);
         setProchaineActionHeure('15:00');
@@ -356,23 +405,93 @@ export const LeadModal: React.FC<LeadModalProps> = ({
         setAutoForm(createDefaultAutoForm());
         setHabitationForm(createDefaultHabitationForm());
         setVtcForm(createDefaultVtcForm());
+        setDocuments([]);
       }
     }
   }, [isOpen, existingLead, cabinetInfo, currentUser]);
 
-  // SIV License Plate Lookup Handler
+  // Détection en temps réel des doublons dans la base de leads
+  const detectedDuplicates = React.useMemo(() => {
+    if (!allLeads || allLeads.length === 0) return [];
+    const curNom = leadType === 'AUTO' ? autoForm.nom : leadType === 'HABITATION' ? habitationForm.nom : vtcForm.nom;
+    const curPrenom = leadType === 'AUTO' ? autoForm.prenom : leadType === 'HABITATION' ? habitationForm.prenom : vtcForm.prenom;
+    const curPhone = leadType === 'AUTO' ? autoForm.telephone : leadType === 'HABITATION' ? habitationForm.telephone : vtcForm.telephone;
+    const curEmail = leadType === 'AUTO' ? autoForm.email : leadType === 'HABITATION' ? habitationForm.email : vtcForm.email;
+    const curImmat = leadType === 'AUTO' ? autoForm.immatriculation : leadType === 'VTC' ? vtcForm.immatriculation : undefined;
+
+    return detectLeadDuplicates(
+      {
+        id: existingLead?.id,
+        nom: curNom,
+        prenom: curPrenom,
+        telephone: curPhone,
+        email: curEmail,
+        immatriculation: curImmat
+      },
+      allLeads,
+      existingLead?.id
+    );
+  }, [allLeads, leadType, autoForm, habitationForm, vtcForm, existingLead]);
+
+  // SIV License Plate Lookup Handler (Real API)
   const [isLoadingSiv, setIsLoadingSiv] = useState(false);
-  const handleSivLookup = () => {
+  const [sivLookupError, setSivLookupError] = useState<string | null>(null);
+  const [sivLookupSuccess, setSivLookupSuccess] = useState<string | null>(null);
+
+  const handleSivLookup = async (target: 'AUTO' | 'VTC' = 'AUTO') => {
+    const rawPlate = target === 'AUTO' ? autoForm.immatriculation : vtcForm.immatriculation;
+    if (!rawPlate || !rawPlate.trim()) {
+      setSivLookupError("Veuillez renseigner un numéro de plaque d'immatriculation.");
+      return;
+    }
+
     setIsLoadingSiv(true);
-    setTimeout(() => {
+    setSivLookupError(null);
+    setSivLookupSuccess(null);
+
+    try {
+      const res = await fetch('/api/siv-lookup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          immatriculation: rawPlate,
+          sivApiToken: cabinetInfo?.sivApiToken,
+          sivProvider: cabinetInfo?.sivProvider,
+          sivCustomEndpoint: cabinetInfo?.sivCustomEndpoint
+        })
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        setSivLookupError(data.error || "Plaque non trouvée dans le registre SIV.");
+        return;
+      }
+
+      const v = data.vehicle;
+      if (target === 'AUTO') {
+        setAutoForm(prev => ({
+          ...prev,
+          immatriculation: v.immatriculation || prev.immatriculation,
+          marqueModele: v.marqueModele || `${v.marque || ''} ${v.modele || ''}`.trim() || prev.marqueModele,
+          dateMiseEnCirculation: v.dateMiseEnCirculation || prev.dateMiseEnCirculation,
+          dateAchat: v.dateAchat || prev.dateAchat
+        }));
+      } else {
+        setVtcForm(prev => ({
+          ...prev,
+          immatriculation: v.immatriculation || prev.immatriculation,
+          marqueModele: v.marqueModele || `${v.marque || ''} ${v.modele || ''}`.trim() || prev.marqueModele
+        }));
+      }
+
+      setSivLookupSuccess(`Données SIV officielles extraites : ${v.marqueModele || v.marque}`);
+      setTimeout(() => setSivLookupSuccess(null), 5000);
+    } catch (err: any) {
+      setSivLookupError(`Erreur lors de la requête SIV : ${err.message || 'Serveur indisponible'}`);
+    } finally {
       setIsLoadingSiv(false);
-      setAutoForm(prev => ({
-        ...prev,
-        marqueModele: 'Renault Austral E-Tech Hybrid 200',
-        dateMiseEnCirculation: '2023-05-10',
-        dateAchat: '2023-06-01'
-      }));
-    }, 600);
+    }
   };
 
   // Sinistre Handler Helpers
@@ -456,7 +575,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
     if (leadType === 'AUTO') {
       civilite = autoForm.civilite || 'Mr';
-      nom = autoForm.nom || 'Sans nom';
+      nom = autoForm.nom || '';
       prenom = autoForm.prenom || '';
       telephone = autoForm.telephone;
       email = autoForm.email;
@@ -464,7 +583,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
       codePostal = autoForm.codePostal;
     } else if (leadType === 'HABITATION') {
       civilite = habitationForm.civilite || 'Mme';
-      nom = habitationForm.nom || 'Sans nom';
+      nom = habitationForm.nom || '';
       prenom = habitationForm.prenom || '';
       telephone = habitationForm.telephone;
       email = habitationForm.email;
@@ -472,12 +591,17 @@ export const LeadModal: React.FC<LeadModalProps> = ({
       codePostal = habitationForm.codePostal;
     } else {
       civilite = vtcForm.civilite || 'Mr';
-      nom = vtcForm.nom || 'Sans nom';
+      nom = vtcForm.nom || '';
       prenom = vtcForm.prenom || '';
       telephone = vtcForm.telephone;
       email = vtcForm.email;
       ville = vtcForm.ville;
       codePostal = vtcForm.codePostal;
+    }
+
+    if (!nom.trim() || !prenom.trim() || !telephone.trim()) {
+      alert("Veuillez obligatoirement renseigner le Nom, le Prénom et le Téléphone du prospect.");
+      return;
     }
 
     const existingNotes = existingLead?.notes || [];
@@ -493,8 +617,20 @@ export const LeadModal: React.FC<LeadModalProps> = ({
     }
 
     const now = new Date().toISOString();
-    const matchedUser = users?.find(u => `${u.prenom} ${u.nom}` === assignedBroker);
+    const matchedUser = users?.find(u => getUserDisplayName(u) === assignedBroker || `${u.prenom} ${u.nom}` === assignedBroker || u.pseudo === assignedBroker);
     const finalEquipe = equipe || matchedUser?.equipe || currentUser?.equipe || 'Équipe Auto & Habitation';
+
+    // Vérification alerte doublon lors de la soumission
+    if (detectedDuplicates.length > 0 && !isEditing) {
+      const firstDup = detectedDuplicates[0];
+      const reasonsList = firstDup.reasons.map(r => `${r.label} (${r.matchedValue})`).join(', ');
+      const confirmProceed = window.confirm(
+        `⚠️ ALERTE DOUBLON DÉTECTÉ !\n\nUn dossier existe déjà dans votre base CRM avec les mêmes coordonnées :\n• Prospect : ${firstDup.lead.prenom} ${firstDup.lead.nom} (Réf: ${firstDup.lead.referenceDevis})\n• Critère(s) de doublon : ${reasonsList}\n• Statut actuel : ${firstDup.lead.status}\n\nSouhaitez-vous tout de même enregistrer ce lead en double ?`
+      );
+      if (!confirmProceed) {
+        return;
+      }
+    }
 
     const savedLead: Lead = {
       id: existingLead?.id || 'lead-' + Date.now(),
@@ -506,6 +642,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
       updatedAt: now,
       assignedBroker,
       attribueA: assignedBroker,
+      assignedTo: matchedUser?.id || existingLead?.assignedTo || currentUser?.id,
       equipe: finalEquipe,
       civilite,
       nom,
@@ -520,31 +657,32 @@ export const LeadModal: React.FC<LeadModalProps> = ({
       prochaineActionIntitule,
       prochaineActionDate,
       prochaineActionHeure,
-      notes: updatedNotes
+      notes: updatedNotes,
+      documents
     };
 
     onSaveLead(savedLead);
     onClose();
   };
 
-  // Helper for dynamic tab counts
-  const autoTabs = ['Conducteur', 'Véhicule', 'Antécédents', 'Proposition', 'Notes & Relance'];
-  const habitationTabs = ['Souscripteur', 'Logement', 'Antécédents', 'Proposition', 'Notes & Relance'];
-  const vtcTabs = ['Chauffeur', 'Société', 'Véhicule', 'Antécédents', 'Proposition', 'Notes & Relance'];
+  // Helper for dynamic tab counts (avec onglet Documents relatif au dossier)
+  const autoTabs = ['Conducteur', 'Véhicule', 'Antécédents', 'Proposition', 'Notes & Relance', 'Documents'];
+  const habitationTabs = ['Souscripteur', 'Logement', 'Antécédents', 'Proposition', 'Notes & Relance', 'Documents'];
+  const vtcTabs = ['Chauffeur', 'Société', 'Véhicule', 'Antécédents', 'Proposition', 'Notes & Relance', 'Documents'];
 
   const currentTabLabels = leadType === 'AUTO' ? autoTabs : leadType === 'HABITATION' ? habitationTabs : vtcTabs;
 
   const getCotisationLabel = (fractionnement: string) => {
     switch (fractionnement) {
       case 'Mensuel':
-        return 'Cotisation Mensuelle (€ TTC) *';
+        return 'Cotisation Mensuelle (€ TTC)';
       case 'Trimestriel':
-        return 'Cotisation Trimestrielle (€ TTC) *';
+        return 'Cotisation Trimestrielle (€ TTC)';
       case 'Semestriel':
-        return 'Cotisation Semestrielle (€ TTC) *';
+        return 'Cotisation Semestrielle (€ TTC)';
       case 'Annuel':
       default:
-        return 'Cotisation Annuelle (€ TTC) *';
+        return 'Cotisation Annuelle (€ TTC)';
     }
   };
 
@@ -634,19 +772,96 @@ export const LeadModal: React.FC<LeadModalProps> = ({
               key={idx}
               type="button"
               onClick={() => setActiveTab(idx)}
-              className={`px-4 py-2.5 text-xs font-bold rounded-t-xl transition border-b-2 whitespace-nowrap ${
+              className={`px-4 py-2.5 text-xs font-bold rounded-t-xl transition border-b-2 whitespace-nowrap flex items-center gap-1.5 ${
                 activeTab === idx
                   ? 'bg-white text-blue-700 border-blue-600 shadow-xs'
                   : 'text-slate-500 hover:text-slate-900 border-transparent'
               }`}
             >
-              <span className="mr-1 text-slate-400">{idx + 1}.</span> {tabLabel}
+              <span className="text-slate-400">{idx + 1}.</span>
+              <span>{tabLabel}</span>
+              {tabLabel === 'Documents' && documents.length > 0 && (
+                <span className="px-1.5 py-0.2 bg-blue-100 text-blue-700 font-extrabold rounded-full text-[10px]">
+                  {documents.length}
+                </span>
+              )}
             </button>
           ))}
         </div>
 
         {/* Form Body Container */}
         <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto p-6 space-y-6">
+
+          {/* BANNIÈRE DÉTECTION DOUBLONS TEMPS RÉEL */}
+          {detectedDuplicates.length > 0 && (
+            <div className="p-4 bg-amber-50 border-2 border-amber-300 rounded-2xl space-y-3 animate-in fade-in">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center space-x-2.5">
+                  <div className="p-2 bg-amber-500 text-white rounded-xl shadow-xs shrink-0">
+                    <AlertTriangle className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-black text-amber-950 uppercase tracking-wider flex items-center gap-1.5">
+                      <span>Attention : Doublon potentiel détecté</span>
+                      <span className="bg-amber-200 text-amber-900 px-2 py-0.5 rounded-full text-[10px] font-extrabold">
+                        {detectedDuplicates.length} dossier{detectedDuplicates.length > 1 ? 's' : ''} similaire{detectedDuplicates.length > 1 ? 's' : ''}
+                      </span>
+                    </h4>
+                    <p className="text-[11px] text-amber-800 mt-0.5">
+                      Ce prospect partage des informations (téléphone, e-mail, immatriculation ou identité) avec un ou plusieurs dossiers déjà enregistrés.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                {detectedDuplicates.map(({ lead: dupLead, reasons }) => (
+                  <div
+                    key={dupLead.id}
+                    className="p-3 bg-white/95 rounded-xl border border-amber-200 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
+                  >
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-extrabold text-slate-900">
+                          {dupLead.prenom} {dupLead.nom}
+                        </span>
+                        <span className="font-mono text-[11px] bg-slate-100 text-slate-700 px-2 py-0.5 rounded font-bold">
+                          {dupLead.referenceDevis}
+                        </span>
+                        <span className="text-[11px] text-slate-500">
+                          {dupLead.ville ? `${dupLead.ville} (${dupLead.codePostal})` : ''}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {reasons.map((r, ri) => (
+                          <span
+                            key={ri}
+                            className="px-2 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 rounded text-[10px] font-bold"
+                          >
+                            ⚠️ {r.label} : <span className="font-mono font-black">{r.matchedValue}</span>
+                          </span>
+                        ))}
+                        <span className="text-[10px] text-slate-500">
+                          Statut : <strong>{dupLead.status}</strong> • Agent : <strong>{dupLead.attribueA || dupLead.assignedBroker}</strong>
+                        </span>
+                      </div>
+                    </div>
+
+                    {onSelectExistingLead && (
+                      <button
+                        type="button"
+                        onClick={() => onSelectExistingLead(dupLead)}
+                        className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold transition shrink-0 cursor-pointer shadow-xs flex items-center gap-1"
+                      >
+                        <span>Consulter ce dossier</span>
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* ========================================================= */}
           {/* AUTO FORM TABS */}
@@ -663,7 +878,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Civilité *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Civilité</label>
                       <select
                         value={autoForm.civilite || 'Mr'}
                         onChange={(e) => setAutoForm({ ...autoForm, civilite: e.target.value as any })}
@@ -711,10 +926,9 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Email *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Email</label>
                       <input
                         type="email"
-                        required
                         value={autoForm.email}
                         onChange={(e) => setAutoForm({ ...autoForm, email: e.target.value })}
                         className="w-full text-xs p-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500"
@@ -723,10 +937,9 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Date de Naissance *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Date de Naissance</label>
                       <input
                         type="date"
-                        required
                         value={autoForm.dateNaissance}
                         onChange={(e) => setAutoForm({ ...autoForm, dateNaissance: e.target.value })}
                         className="w-full text-xs p-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500"
@@ -734,10 +947,9 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Date d'Obtention Permis B *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Date d'Obtention Permis B</label>
                       <input
                         type="date"
-                        required
                         value={autoForm.datePermis}
                         onChange={(e) => setAutoForm({ ...autoForm, datePermis: e.target.value })}
                         className="w-full text-xs p-2.5 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500"
@@ -831,7 +1043,6 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                         <label className="block text-xs font-bold text-slate-800 mb-1">Immatriculation (SIV)</label>
                         <input
                           type="text"
-                          required
                           value={autoForm.immatriculation}
                           onChange={(e) => setAutoForm({ ...autoForm, immatriculation: e.target.value.toUpperCase() })}
                           className="w-full text-sm font-mono font-bold uppercase tracking-wider p-2.5 rounded-lg border border-slate-300 bg-amber-50/40 text-slate-900"
@@ -841,28 +1052,102 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
                       <button
                         type="button"
-                        onClick={handleSivLookup}
+                        onClick={() => handleSivLookup('AUTO')}
                         disabled={isLoadingSiv}
                         className="px-4 py-2.5 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition cursor-pointer"
                       >
                         <Search className="w-3.5 h-3.5 text-amber-400" />
-                        <span>{isLoadingSiv ? 'Décodage SIV...' : 'Recherche SIV'}</span>
+                        <span>{isLoadingSiv ? 'Interrogation SIV...' : 'Recherche SIV'}</span>
                       </button>
                     </div>
 
-                    <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Marque / Modèle / Version</label>
-                      <input
-                        type="text"
-                        value={autoForm.marqueModele || ''}
-                        onChange={(e) => setAutoForm({ ...autoForm, marqueModele: e.target.value })}
-                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300"
-                        placeholder="ex: Peugeot 3008 GT Line 1.2 PureTech"
-                      />
+                    {/* SIV Feedback Messages */}
+                    {sivLookupError && (
+                      <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl text-xs text-amber-900 flex items-start gap-2 animate-in fade-in">
+                        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                        <div className="space-y-1">
+                          <p className="font-semibold">{sivLookupError}</p>
+                          <p className="text-[11px] text-amber-800">
+                            Astuce : Si vous n'avez pas de clé SIV, vous pouvez saisir manuellement la marque et le modèle exacts ci-dessous.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                    {sivLookupSuccess && (
+                      <div className="p-2.5 bg-emerald-50 border border-emerald-300 rounded-xl text-xs text-emerald-900 flex items-center gap-2 animate-in fade-in">
+                        <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span className="font-semibold">{sivLookupSuccess}</span>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">Marque & Modèle</label>
+                        <input
+                          type="text"
+                          value={autoForm.marqueModele || ''}
+                          onChange={(e) => setAutoForm({ ...autoForm, marqueModele: e.target.value })}
+                          className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-semibold"
+                          placeholder="ex: Peugeot 3008, Renault Clio V..."
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-slate-700 mb-1">Version / Finition / Moteur</label>
+                        <input
+                          type="text"
+                          value={autoForm.version || ''}
+                          onChange={(e) => setAutoForm({ ...autoForm, version: e.target.value })}
+                          className="w-full text-xs p-2.5 rounded-lg border border-slate-300"
+                          placeholder="ex: 1.2 PureTech 130ch Allure, TCe 90 Intens..."
+                        />
+                      </div>
                     </div>
                   </div>
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Énergie / Motorisation</label>
+                      <select
+                        value={autoForm.energie || 'Essence'}
+                        onChange={(e) => setAutoForm({ ...autoForm, energie: e.target.value as any })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-medium"
+                      >
+                        <option value="Essence">Essence</option>
+                        <option value="Diesel">Diesel</option>
+                        <option value="Hybride">Hybride (Non rechargeable)</option>
+                        <option value="Hybride Rechargeable">Hybride Rechargeable (PHEV)</option>
+                        <option value="Électrique">100% Électrique</option>
+                        <option value="GPL">GPL</option>
+                        <option value="Bioéthanol E85">Superéthanol E85</option>
+                        <option value="Autre">Autre</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Puissance Fiscale (CV)</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="99"
+                        value={autoForm.puissanceFiscale || ''}
+                        onChange={(e) => setAutoForm({ ...autoForm, puissanceFiscale: parseInt(e.target.value) || undefined })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-bold"
+                        placeholder="ex: 5 CV"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Valeur estimée / Prix d'achat (€)</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={autoForm.valeurEstimee || ''}
+                        onChange={(e) => setAutoForm({ ...autoForm, valeurEstimee: parseFloat(e.target.value) || undefined })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-semibold"
+                        placeholder="ex: 18 500 €"
+                      />
+                    </div>
+
                     <div>
                       <label className="block text-xs font-bold text-slate-700 mb-1">Date de 1ère Mise en Circulation</label>
                       <input
@@ -884,6 +1169,22 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                     </div>
 
                     <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Statut d'Acquisition</label>
+                      <select
+                        value={autoForm.statutVehicule || 'Occasion'}
+                        onChange={(e) => setAutoForm({ ...autoForm, statutVehicule: e.target.value as any })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-medium"
+                      >
+                        <option value="Occasion">Véhicule d'occasion</option>
+                        <option value="Neuf">Véhicule neuf</option>
+                        <option value="LOA">Location Option Achat (LOA)</option>
+                        <option value="LLD">Location Longue Durée (LLD)</option>
+                        <option value="Crédit">Achat à crédit</option>
+                        <option value="Comptant">Achat comptant</option>
+                      </select>
+                    </div>
+
+                    <div>
                       <label className="block text-xs font-bold text-slate-700 mb-1">Type d'Utilisation du Véhicule</label>
                       <select
                         value={autoForm.typeUtilisation}
@@ -897,7 +1198,43 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                       </select>
                     </div>
 
-                    <div className="sm:col-span-2">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Kilométrage Annuel</label>
+                      <select
+                        value={autoForm.kilometrageAnnuel || '15 000–20 000'}
+                        onChange={(e) => setAutoForm({ ...autoForm, kilometrageAnnuel: e.target.value })}
+                        className={`w-full text-xs p-2.5 rounded-lg border font-bold ${
+                          autoForm.kilometrageAnnuel === 'Kilométrage illimité'
+                            ? 'border-indigo-400 bg-indigo-50/70 text-indigo-950'
+                            : 'border-slate-300'
+                        }`}
+                      >
+                        <option value="< 5 000 km">&lt; 5 000 km / an (Petit rouleur)</option>
+                        <option value="5 000–10 000">5 000 à 10 000 km / an</option>
+                        <option value="10 000–15 000">10 000 à 15 000 km / an</option>
+                        <option value="15 000–20 000">15 000 à 20 000 km / an</option>
+                        <option value="20 000–30 000">20 000 à 30 000 km / an</option>
+                        <option value="> 30 000">&gt; 30 000 km / an (Grand rouleur)</option>
+                        <option value="Kilométrage illimité">⚡ Kilométrage illimité (Sans limite)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Stationnement la Nuit</label>
+                      <select
+                        value={autoForm.stationnementNuit || 'Parking privé'}
+                        onChange={(e) => setAutoForm({ ...autoForm, stationnementNuit: e.target.value as any })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-medium"
+                      >
+                        <option value="Garage fermé">Garage individuel fermé</option>
+                        <option value="Parking privé">Parking privé clos / Box</option>
+                        <option value="Cour fermée">Cour ou jardin clôturé</option>
+                        <option value="Parking collectif">Parking collectif souterrain/extérieur</option>
+                        <option value="Voie publique">Voie publique / Rue</option>
+                      </select>
+                    </div>
+
+                    <div className="sm:col-span-2 lg:col-span-3">
                       <label className="block text-xs font-bold text-slate-700 mb-1">Propriétaire du Véhicule (Carte Grise)</label>
                       <select
                         value={autoForm.proprietaireVehicule}
@@ -1238,22 +1575,199 @@ export const LeadModal: React.FC<LeadModalProps> = ({
               {/* TAB 3: PROPOSITION */}
               {activeTab === 3 && (
                 <div className="space-y-5">
-                  <h4 className="text-sm font-bold text-slate-900 border-b border-slate-200 pb-2 flex items-center gap-2">
-                    <FileCheck className="w-4 h-4 text-blue-600" />
-                    Proposition de Tarif & Options Incluses
-                  </h4>
+                  <div className="border-b border-slate-200 pb-2 flex items-center justify-between">
+                    <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <FileCheck className="w-4 h-4 text-blue-600" />
+                      Étude Comparative des 3 Formules & Devoir de Conseil
+                    </h4>
+                    <span className="text-[11px] text-blue-700 bg-blue-50 px-2.5 py-0.5 rounded-full font-bold border border-blue-200">
+                      3 formules comparées
+                    </span>
+                  </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {/* Module de comparaison des 3 formules (Tiers Simple / Tiers Étendu / Tous Risques) */}
+                  <div className="space-y-2">
+                    <label className="block text-xs font-bold text-slate-800">
+                      Cotisation des 3 Formules pour le comparatif & devoir de conseil :
+                    </label>
+                    <p className="text-[11px] text-slate-500">
+                      Renseignez les cotisations des 3 solutions étudiées. Cliquez sur une formule pour la sélectionner comme offre retenue.
+                    </p>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
+                      {/* Formule 1: Tiers Simple */}
+                      <div
+                        onClick={() => {
+                          setAutoForm({
+                            ...autoForm,
+                            formuleSouhaitee: 'Tiers Simple',
+                            cotisationMontant: autoForm.cotisationTiersSimple || autoForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          autoForm.formuleSouhaitee === 'Tiers Simple'
+                            ? 'border-blue-600 bg-blue-50/50 shadow-xs ring-1 ring-blue-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">1. Tiers Simple</span>
+                            {autoForm.formuleSouhaitee === 'Tiers Simple' && (
+                              <span className="text-[10px] font-black text-blue-700 bg-blue-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            RC Obligatoire + Défense & Recours + Assistance de base
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({autoForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={autoForm.cotisationTiersSimple || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setAutoForm({
+                                ...autoForm,
+                                cotisationTiersSimple: val,
+                                cotisationMontant: autoForm.formuleSouhaitee === 'Tiers Simple' ? val : autoForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 35.00"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Formule 2: Tiers Étendu */}
+                      <div
+                        onClick={() => {
+                          setAutoForm({
+                            ...autoForm,
+                            formuleSouhaitee: 'Tiers Étendu (Vol/Incendie)',
+                            cotisationMontant: autoForm.cotisationTiersEtendu || autoForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          autoForm.formuleSouhaitee === 'Tiers Étendu (Vol/Incendie)'
+                            ? 'border-blue-600 bg-blue-50/50 shadow-xs ring-1 ring-blue-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">2. Tiers Étendu</span>
+                            {autoForm.formuleSouhaitee === 'Tiers Étendu (Vol/Incendie)' && (
+                              <span className="text-[10px] font-black text-blue-700 bg-blue-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            Tiers + Vol, Incendie, Bris de glace, Catastrophes nat.
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({autoForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={autoForm.cotisationTiersEtendu || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setAutoForm({
+                                ...autoForm,
+                                cotisationTiersEtendu: val,
+                                cotisationMontant: autoForm.formuleSouhaitee === 'Tiers Étendu (Vol/Incendie)' ? val : autoForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 55.00"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Formule 3: Tous Risques */}
+                      <div
+                        onClick={() => {
+                          setAutoForm({
+                            ...autoForm,
+                            formuleSouhaitee: 'Tous Risques',
+                            cotisationMontant: autoForm.cotisationTousRisques || autoForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          autoForm.formuleSouhaitee === 'Tous Risques'
+                            ? 'border-blue-600 bg-blue-50/50 shadow-xs ring-1 ring-blue-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">3. Tous Risques</span>
+                            {autoForm.formuleSouhaitee === 'Tous Risques' && (
+                              <span className="text-[10px] font-black text-blue-700 bg-blue-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            Dommages Tous Accidents + Vandalisme + Couverture max
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({autoForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={autoForm.cotisationTousRisques || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setAutoForm({
+                                ...autoForm,
+                                cotisationTousRisques: val,
+                                cotisationMontant: autoForm.formuleSouhaitee === 'Tous Risques' ? val : autoForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 85.00"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-2">
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Choix de la Formule *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Formule Retenue</label>
                       <select
                         value={autoForm.formuleSouhaitee}
-                        onChange={(e) => setAutoForm({ ...autoForm, formuleSouhaitee: e.target.value as any })}
-                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-bold text-blue-900 bg-blue-50/30"
+                        onChange={(e) => {
+                          const f = e.target.value as any;
+                          let price = autoForm.cotisationMontant;
+                          if (f === 'Tiers Simple' && autoForm.cotisationTiersSimple) price = autoForm.cotisationTiersSimple;
+                          if (f === 'Tiers Étendu (Vol/Incendie)' && autoForm.cotisationTiersEtendu) price = autoForm.cotisationTiersEtendu;
+                          if (f === 'Tous Risques' && autoForm.cotisationTousRisques) price = autoForm.cotisationTousRisques;
+                          setAutoForm({ ...autoForm, formuleSouhaitee: f, cotisationMontant: price });
+                        }}
+                        className="w-full text-xs p-2.5 rounded-lg border border-blue-400 font-bold text-blue-900 bg-blue-50/50"
                       >
-                        <option value="Tiers Simple">Tiers Simple (RC + Défense Recours)</option>
-                        <option value="Tiers Étendu (Vol/Incendie)">Tiers Étendu (Vol, Incendie, Brise de Glace)</option>
-                        <option value="Tous Risques">Tous Risques (Dommages Tous Accidents)</option>
+                        <option value="Tiers Simple">1. Tiers Simple</option>
+                        <option value="Tiers Étendu (Vol/Incendie)">2. Tiers Étendu</option>
+                        <option value="Tous Risques">3. Tous Risques</option>
                       </select>
                     </div>
 
@@ -1273,13 +1787,22 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
                     <div>
                       <label className="block text-xs font-bold text-slate-700 mb-1">
-                        {getCotisationLabel(autoForm.fractionnement)}
+                        Cotisation Validée ({autoForm.fractionnement})
                       </label>
                       <input
                         type="number"
-                        required
+                        step="0.01"
                         value={autoForm.cotisationMontant}
-                        onChange={(e) => setAutoForm({ ...autoForm, cotisationMontant: parseFloat(e.target.value) || 0 })}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 0;
+                          setAutoForm({
+                            ...autoForm,
+                            cotisationMontant: val,
+                            ...(autoForm.formuleSouhaitee === 'Tiers Simple' ? { cotisationTiersSimple: val } : {}),
+                            ...(autoForm.formuleSouhaitee === 'Tiers Étendu (Vol/Incendie)' ? { cotisationTiersEtendu: val } : {}),
+                            ...(autoForm.formuleSouhaitee === 'Tous Risques' ? { cotisationTousRisques: val } : {})
+                          });
+                        }}
                         className="w-full text-sm font-bold text-emerald-800 p-2.5 rounded-lg border border-emerald-300 bg-emerald-50/50"
                         placeholder="65"
                       />
@@ -1351,21 +1874,6 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                         {statusesOptions.map(st => (
                           <option key={st.id} value={st.id}>{st.label}</option>
                         ))}
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Niveau de Qualification</label>
-                      <select
-                        value={qualification}
-                        onChange={(e) => setQualification(e.target.value as LeadQualification)}
-                        className="w-full text-xs font-bold p-2.5 rounded-lg border border-slate-300"
-                      >
-                        <option value="CHAUD">🔥 CHAUD (Intérêt élevé)</option>
-                        <option value="TIEDE">⚡ TIÈDE (A comparer)</option>
-                        <option value="FROID">❄️ FROID (Relancer plus tard)</option>
-                        <option value="INJOIGNABLE">📞 INJOIGNABLE</option>
-                        <option value="HORS_CIBLE">❌ HORS CIBLE</option>
                       </select>
                     </div>
 
@@ -1444,7 +1952,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Civilité *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Civilité</label>
                       <select
                         value={habitationForm.civilite || 'Mme'}
                         onChange={(e) => setHabitationForm({ ...habitationForm, civilite: e.target.value as any })}
@@ -1492,10 +2000,9 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Email *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Email</label>
                       <input
                         type="email"
-                        required
                         value={habitationForm.email}
                         onChange={(e) => setHabitationForm({ ...habitationForm, email: e.target.value })}
                         className="w-full text-xs p-2.5 rounded-lg border border-slate-300"
@@ -1731,23 +2238,200 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
               {/* TAB 3: PROPOSITION HABITATION */}
               {activeTab === 3 && (
-                <div className="space-y-4">
-                  <h4 className="text-sm font-bold text-slate-900 border-b border-slate-200 pb-2 flex items-center gap-2">
-                    <FileCheck className="w-4 h-4 text-emerald-600" />
-                    Proposition Tarifaire Habitation
-                  </h4>
+                <div className="space-y-5">
+                  <div className="border-b border-slate-200 pb-2 flex items-center justify-between">
+                    <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <FileCheck className="w-4 h-4 text-emerald-600" />
+                      Étude Comparative des 3 Formules MRH & Devoir de Conseil
+                    </h4>
+                    <span className="text-[11px] text-emerald-700 bg-emerald-50 px-2.5 py-0.5 rounded-full font-bold border border-emerald-200">
+                      3 formules comparées
+                    </span>
+                  </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {/* Module de comparaison des 3 formules Habitation */}
+                  <div className="space-y-2">
+                    <label className="block text-xs font-bold text-slate-800">
+                      Cotisation des 3 Formules pour le comparatif & devoir de conseil :
+                    </label>
+                    <p className="text-[11px] text-slate-500">
+                      Renseignez les cotisations des 3 formules étudiées. Cliquez sur une formule pour la sélectionner comme offre retenue.
+                    </p>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
+                      {/* Formule 1: Éco */}
+                      <div
+                        onClick={() => {
+                          setHabitationForm({
+                            ...habitationForm,
+                            formuleSouhaitee: 'Formule Éco',
+                            cotisationMontant: habitationForm.cotisationFormuleEco || habitationForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          habitationForm.formuleSouhaitee === 'Formule Éco'
+                            ? 'border-emerald-600 bg-emerald-50/50 shadow-xs ring-1 ring-emerald-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">1. Formule Éco</span>
+                            {habitationForm.formuleSouhaitee === 'Formule Éco' && (
+                              <span className="text-[10px] font-black text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            Incendie + Dégât des eaux + RC Vie Privée + Catastrophes naturelles
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({habitationForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={habitationForm.cotisationFormuleEco || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setHabitationForm({
+                                ...habitationForm,
+                                cotisationFormuleEco: val,
+                                cotisationMontant: habitationForm.formuleSouhaitee === 'Formule Éco' ? val : habitationForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 16.00"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Formule 2: Confort */}
+                      <div
+                        onClick={() => {
+                          setHabitationForm({
+                            ...habitationForm,
+                            formuleSouhaitee: 'Formule Confort',
+                            cotisationMontant: habitationForm.cotisationFormuleConfort || habitationForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          habitationForm.formuleSouhaitee === 'Formule Confort'
+                            ? 'border-emerald-600 bg-emerald-50/50 shadow-xs ring-1 ring-emerald-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">2. Formule Confort</span>
+                            {habitationForm.formuleSouhaitee === 'Formule Confort' && (
+                              <span className="text-[10px] font-black text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            Éco + Vol/Vandalisme + Bris de glace + Dommages électriques
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({habitationForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={habitationForm.cotisationFormuleConfort || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setHabitationForm({
+                                ...habitationForm,
+                                cotisationFormuleConfort: val,
+                                cotisationMontant: habitationForm.formuleSouhaitee === 'Formule Confort' ? val : habitationForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 25.00"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Formule 3: Premium Tous Risques */}
+                      <div
+                        onClick={() => {
+                          setHabitationForm({
+                            ...habitationForm,
+                            formuleSouhaitee: 'Formule Premium Tous Risques',
+                            cotisationMontant: habitationForm.cotisationFormuleTousRisques || habitationForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          habitationForm.formuleSouhaitee === 'Formule Premium Tous Risques'
+                            ? 'border-emerald-600 bg-emerald-50/50 shadow-xs ring-1 ring-emerald-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">3. Formule Tous Risques</span>
+                            {habitationForm.formuleSouhaitee === 'Formule Premium Tous Risques' && (
+                              <span className="text-[10px] font-black text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            Rééquipement à neuf + Valeur majorée + Protection Juridique max
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({habitationForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={habitationForm.cotisationFormuleTousRisques || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setHabitationForm({
+                                ...habitationForm,
+                                cotisationFormuleTousRisques: val,
+                                cotisationMontant: habitationForm.formuleSouhaitee === 'Formule Premium Tous Risques' ? val : habitationForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 38.00"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-2">
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Formule MRH *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Formule Retenue</label>
                       <select
                         value={habitationForm.formuleSouhaitee}
-                        onChange={(e) => setHabitationForm({ ...habitationForm, formuleSouhaitee: e.target.value as any })}
-                        className="w-full text-xs font-bold p-2.5 rounded-lg border border-slate-300 text-emerald-900 bg-emerald-50/30"
+                        onChange={(e) => {
+                          const f = e.target.value as any;
+                          let price = habitationForm.cotisationMontant;
+                          if (f === 'Formule Éco' && habitationForm.cotisationFormuleEco) price = habitationForm.cotisationFormuleEco;
+                          if (f === 'Formule Confort' && habitationForm.cotisationFormuleConfort) price = habitationForm.cotisationFormuleConfort;
+                          if (f === 'Formule Premium Tous Risques' && habitationForm.cotisationFormuleTousRisques) price = habitationForm.cotisationFormuleTousRisques;
+                          setHabitationForm({ ...habitationForm, formuleSouhaitee: f, cotisationMontant: price });
+                        }}
+                        className="w-full text-xs font-bold p-2.5 rounded-lg border border-emerald-400 text-emerald-900 bg-emerald-50/50"
                       >
-                        <option value="Formule Éco">Formule Éco (Essentielle)</option>
-                        <option value="Formule Confort">Formule Confort (Standard)</option>
-                        <option value="Formule Premium Tous Risques">Formule Premium Tous Risques</option>
+                        <option value="Formule Éco">1. Formule Éco (Essentielle)</option>
+                        <option value="Formule Confort">2. Formule Confort (Standard)</option>
+                        <option value="Formule Premium Tous Risques">3. Formule Premium Tous Risques</option>
                       </select>
                     </div>
 
@@ -1767,13 +2451,22 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
                     <div>
                       <label className="block text-xs font-bold text-slate-700 mb-1">
-                        {getCotisationLabel(habitationForm.fractionnement)}
+                        Cotisation Validée ({habitationForm.fractionnement})
                       </label>
                       <input
                         type="number"
-                        required
+                        step="0.01"
                         value={habitationForm.cotisationMontant}
-                        onChange={(e) => setHabitationForm({ ...habitationForm, cotisationMontant: parseFloat(e.target.value) || 0 })}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 0;
+                          setHabitationForm({
+                            ...habitationForm,
+                            cotisationMontant: val,
+                            ...(habitationForm.formuleSouhaitee === 'Formule Éco' ? { cotisationFormuleEco: val } : {}),
+                            ...(habitationForm.formuleSouhaitee === 'Formule Confort' ? { cotisationFormuleConfort: val } : {}),
+                            ...(habitationForm.formuleSouhaitee === 'Formule Premium Tous Risques' ? { cotisationFormuleTousRisques: val } : {})
+                          });
+                        }}
                         className="w-full text-sm font-bold text-emerald-800 p-2.5 rounded-lg border border-emerald-300 bg-emerald-50/50"
                         placeholder="24"
                       />
@@ -1847,20 +2540,6 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                       </select>
                     </div>
 
-                    <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Niveau Qualification</label>
-                      <select
-                        value={qualification}
-                        onChange={(e) => setQualification(e.target.value as LeadQualification)}
-                        className="w-full text-xs font-bold p-2.5 rounded-lg border border-slate-300"
-                      >
-                        <option value="CHAUD">🔥 CHAUD</option>
-                        <option value="TIEDE">⚡ TIÈDE</option>
-                        <option value="FROID">❄️ FROID</option>
-                        <option value="INJOIGNABLE">📞 INJOIGNABLE</option>
-                      </select>
-                    </div>
-
                     {renderAgentSelect()}
 
                     <div>
@@ -1896,7 +2575,7 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Civilité *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Civilité</label>
                       <select
                         value={vtcForm.civilite || 'Mr'}
                         onChange={(e) => setVtcForm({ ...vtcForm, civilite: e.target.value as any })}
@@ -1944,10 +2623,9 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Numéro Carte Pro VTC *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Numéro Carte Pro VTC</label>
                       <input
                         type="text"
-                        required
                         value={vtcForm.numeroCarteVtc}
                         onChange={(e) => setVtcForm({ ...vtcForm, numeroCarteVtc: e.target.value })}
                         className="w-full text-xs font-mono font-bold p-2.5 rounded-lg border border-amber-300 bg-amber-50/40 text-amber-950"
@@ -2067,17 +2745,28 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                     Véhicule Exploité pour l'activité VTC
                   </h4>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Immatriculation VTC *</label>
-                      <input
-                        type="text"
-                        required
-                        value={vtcForm.immatriculation}
-                        onChange={(e) => setVtcForm({ ...vtcForm, immatriculation: e.target.value.toUpperCase() })}
-                        className="w-full text-xs font-mono font-bold uppercase p-2.5 rounded-lg border border-amber-300 bg-amber-50/50"
-                        placeholder="GK-410-TP"
-                      />
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Immatriculation VTC</label>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={vtcForm.immatriculation}
+                          onChange={(e) => setVtcForm({ ...vtcForm, immatriculation: e.target.value.toUpperCase() })}
+                          className="flex-1 text-xs font-mono font-bold uppercase p-2.5 rounded-lg border border-amber-300 bg-amber-50/50"
+                          placeholder="GK-410-TP"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleSivLookup('VTC')}
+                          disabled={isLoadingSiv}
+                          className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition cursor-pointer shrink-0"
+                          title="Interroger le SIV pour ce véhicule VTC"
+                        >
+                          <Search className="w-3.5 h-3.5 text-amber-400" />
+                          <span>{isLoadingSiv ? '...' : 'SIV'}</span>
+                        </button>
+                      </div>
                     </div>
 
                     <div>
@@ -2086,13 +2775,26 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                         type="text"
                         value={vtcForm.marqueModele}
                         onChange={(e) => setVtcForm({ ...vtcForm, marqueModele: e.target.value })}
-                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300"
-                        placeholder="Tesla Model 3 / Mercedes Classe E"
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-semibold"
+                        placeholder="Tesla Model 3, Mercedes Classe E..."
                       />
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Motorisation</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Version / Finition</label>
+                      <input
+                        type="text"
+                        value={vtcForm.version || ''}
+                        onChange={(e) => setVtcForm({ ...vtcForm, version: e.target.value })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300"
+                        placeholder="ex: Longue Autonomie AWD, 220d Avantgarde..."
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Motorisation / Énergie</label>
                       <select
                         value={vtcForm.typeMotorisation}
                         onChange={(e) => setVtcForm({ ...vtcForm, typeMotorisation: e.target.value as any })}
@@ -2102,6 +2804,94 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                         <option value="Hybride">Hybride / Hybride Rechargeable</option>
                         <option value="Diesel">Diesel Euro 6</option>
                         <option value="Essence">Essence</option>
+                        <option value="Bioéthanol E85">Superéthanol E85</option>
+                        <option value="Autre">Autre</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Puissance Fiscale (CV)</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="99"
+                        value={vtcForm.puissanceFiscale || ''}
+                        onChange={(e) => setVtcForm({ ...vtcForm, puissanceFiscale: parseInt(e.target.value) || undefined })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-bold"
+                        placeholder="ex: 7 CV"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Valeur estimée / Achat (€)</label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={vtcForm.valeurEstimee || ''}
+                        onChange={(e) => setVtcForm({ ...vtcForm, valeurEstimee: parseFloat(e.target.value) || undefined })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-semibold"
+                        placeholder="ex: 42 000 €"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Année / 1ère Mise en Circ.</label>
+                      <input
+                        type="text"
+                        value={vtcForm.anneeVehicule || ''}
+                        onChange={(e) => setVtcForm({ ...vtcForm, anneeVehicule: e.target.value })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300"
+                        placeholder="2023"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Statut d'Acquisition</label>
+                      <select
+                        value={vtcForm.statutVehicule || 'LOA'}
+                        onChange={(e) => setVtcForm({ ...vtcForm, statutVehicule: e.target.value as any })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-medium"
+                      >
+                        <option value="LOA">Location Option Achat (LOA)</option>
+                        <option value="LLD">Location Longue Durée (LLD)</option>
+                        <option value="Crédit">Achat à crédit</option>
+                        <option value="Comptant">Achat comptant</option>
+                        <option value="Occasion">Véhicule d'occasion</option>
+                        <option value="Neuf">Véhicule neuf</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Kilométrage Annuel</label>
+                      <select
+                        value={vtcForm.kilometrageAnnuel || 'Kilométrage illimité'}
+                        onChange={(e) => setVtcForm({ ...vtcForm, kilometrageAnnuel: e.target.value })}
+                        className={`w-full text-xs p-2.5 rounded-lg border font-bold ${
+                          vtcForm.kilometrageAnnuel === 'Kilométrage illimité'
+                            ? 'border-amber-400 bg-amber-50/70 text-amber-950'
+                            : 'border-slate-300'
+                        }`}
+                      >
+                        <option value="Kilométrage illimité">⚡ Kilométrage illimité (Usage Pro standard)</option>
+                        <option value="< 20 000 km">&lt; 20 000 km / an</option>
+                        <option value="20 000–40 000">20 000 à 40 000 km / an</option>
+                        <option value="40 000–60 000">40 000 à 60 000 km / an</option>
+                        <option value="> 60 000">&gt; 60 000 km / an</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Stationnement la Nuit</label>
+                      <select
+                        value={vtcForm.stationnementNuit || 'Garage fermé'}
+                        onChange={(e) => setVtcForm({ ...vtcForm, stationnementNuit: e.target.value as any })}
+                        className="w-full text-xs p-2.5 rounded-lg border border-slate-300 font-medium"
+                      >
+                        <option value="Garage fermé">Garage individuel fermé</option>
+                        <option value="Parking privé">Parking privé sécurisé / Box</option>
+                        <option value="Cour fermée">Cour fermée</option>
+                        <option value="Parking collectif">Parking collectif souterrain</option>
+                        <option value="Voie publique">Voie publique / Rue</option>
                       </select>
                     </div>
 
@@ -2441,22 +3231,200 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
               {/* TAB 4: PROPOSITION VTC */}
               {activeTab === 4 && (
-                <div className="space-y-4">
-                  <h4 className="text-sm font-bold text-slate-900 border-b border-slate-200 pb-2 flex items-center gap-2">
-                    <FileCheck className="w-4 h-4 text-amber-600" />
-                    Offre VTC Globale & Tarification
-                  </h4>
+                <div className="space-y-5">
+                  <div className="border-b border-slate-200 pb-2 flex items-center justify-between">
+                    <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                      <FileCheck className="w-4 h-4 text-amber-600" />
+                      Étude Comparative des 3 Formules VTC & Devoir de Conseil
+                    </h4>
+                    <span className="text-[11px] text-amber-800 bg-amber-50 px-2.5 py-0.5 rounded-full font-bold border border-amber-200">
+                      3 formules comparées
+                    </span>
+                  </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {/* Module de comparaison des 3 formules VTC */}
+                  <div className="space-y-2">
+                    <label className="block text-xs font-bold text-slate-800">
+                      Cotisation des 3 Formules VTC pour le comparatif & devoir de conseil :
+                    </label>
+                    <p className="text-[11px] text-slate-500">
+                      Renseignez les cotisations des 3 solutions professionnelles étudiées. Cliquez sur une formule pour la sélectionner comme offre retenue.
+                    </p>
+
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
+                      {/* Formule 1: Tiers VTC + RC Pro */}
+                      <div
+                        onClick={() => {
+                          setVtcForm({
+                            ...vtcForm,
+                            formuleSouhaitee: 'Tiers VTC + RC Pro',
+                            cotisationMontant: vtcForm.cotisationTiersSimple || vtcForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          vtcForm.formuleSouhaitee === 'Tiers VTC + RC Pro'
+                            ? 'border-amber-600 bg-amber-50/50 shadow-xs ring-1 ring-amber-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">1. Tiers VTC + RC Pro</span>
+                            {vtcForm.formuleSouhaitee === 'Tiers VTC + RC Pro' && (
+                              <span className="text-[10px] font-black text-amber-800 bg-amber-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            RC Circulation VTC + RC Exploitation Pro + Défense Recours
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({vtcForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={vtcForm.cotisationTiersSimple || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setVtcForm({
+                                ...vtcForm,
+                                cotisationTiersSimple: val,
+                                cotisationMontant: vtcForm.formuleSouhaitee === 'Tiers VTC + RC Pro' ? val : vtcForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 115.00"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Formule 2: Tiers Étendu VTC + RC Pro */}
+                      <div
+                        onClick={() => {
+                          setVtcForm({
+                            ...vtcForm,
+                            formuleSouhaitee: 'Tiers Étendu VTC + RC Pro',
+                            cotisationMontant: vtcForm.cotisationTiersEtendu || vtcForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          vtcForm.formuleSouhaitee === 'Tiers Étendu VTC + RC Pro'
+                            ? 'border-amber-600 bg-amber-50/50 shadow-xs ring-1 ring-amber-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">2. Tiers Étendu VTC + RC Pro</span>
+                            {vtcForm.formuleSouhaitee === 'Tiers Étendu VTC + RC Pro' && (
+                              <span className="text-[10px] font-black text-amber-800 bg-amber-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            Tiers VTC + Vol, Incendie, Bris de glace, Catastrophes climatiques
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({vtcForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={vtcForm.cotisationTiersEtendu || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setVtcForm({
+                                ...vtcForm,
+                                cotisationTiersEtendu: val,
+                                cotisationMontant: vtcForm.formuleSouhaitee === 'Tiers Étendu VTC + RC Pro' ? val : vtcForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 145.00"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Formule 3: Tous Risques VTC + RC Pro */}
+                      <div
+                        onClick={() => {
+                          setVtcForm({
+                            ...vtcForm,
+                            formuleSouhaitee: 'Tous Risques VTC + RC Pro',
+                            cotisationMontant: vtcForm.cotisationTousRisques || vtcForm.cotisationMontant
+                          });
+                        }}
+                        className={`p-3.5 rounded-xl border-2 transition cursor-pointer relative flex flex-col justify-between ${
+                          vtcForm.formuleSouhaitee === 'Tous Risques VTC + RC Pro'
+                            ? 'border-amber-600 bg-amber-50/50 shadow-xs ring-1 ring-amber-500'
+                            : 'border-slate-200 bg-white hover:border-slate-300'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-xs font-bold text-slate-900">3. Tous Risques VTC + RC Pro</span>
+                            {vtcForm.formuleSouhaitee === 'Tous Risques VTC + RC Pro' && (
+                              <span className="text-[10px] font-black text-amber-800 bg-amber-100 px-2 py-0.5 rounded-full">
+                                ★ Retenue
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-500 leading-tight mb-3">
+                            Dommages Tous Accidents VTC + Vandalisme + RC Pro intégrale
+                          </p>
+                        </div>
+                        <div>
+                          <label className="block text-[10px] font-bold text-slate-600 mb-1">
+                            Cotisation ({vtcForm.fractionnement}) €
+                          </label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={vtcForm.cotisationTousRisques || ''}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setVtcForm({
+                                ...vtcForm,
+                                cotisationTousRisques: val,
+                                cotisationMontant: vtcForm.formuleSouhaitee === 'Tous Risques VTC + RC Pro' ? val : vtcForm.cotisationMontant
+                              });
+                            }}
+                            className="w-full text-sm font-bold text-slate-900 p-2 rounded-lg border border-slate-300 bg-white"
+                            placeholder="ex: 185.00"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-2">
                     <div>
-                      <label className="block text-xs font-bold text-slate-700 mb-1">Pack Assurance VTC *</label>
+                      <label className="block text-xs font-bold text-slate-700 mb-1">Formule Retenue</label>
                       <select
                         value={vtcForm.formuleSouhaitee}
-                        onChange={(e) => setVtcForm({ ...vtcForm, formuleSouhaitee: e.target.value as any })}
-                        className="w-full text-xs font-bold p-2.5 rounded-lg border border-slate-300 text-amber-950 bg-amber-50/40"
+                        onChange={(e) => {
+                          const f = e.target.value as any;
+                          let price = vtcForm.cotisationMontant;
+                          if (f === 'Tiers VTC + RC Pro' && vtcForm.cotisationTiersSimple) price = vtcForm.cotisationTiersSimple;
+                          if (f === 'Tiers Étendu VTC + RC Pro' && vtcForm.cotisationTiersEtendu) price = vtcForm.cotisationTiersEtendu;
+                          if (f === 'Tous Risques VTC + RC Pro' && vtcForm.cotisationTousRisques) price = vtcForm.cotisationTousRisques;
+                          setVtcForm({ ...vtcForm, formuleSouhaitee: f, cotisationMontant: price });
+                        }}
+                        className="w-full text-xs font-bold p-2.5 rounded-lg border border-amber-400 text-amber-950 bg-amber-50/50"
                       >
-                        <option value="Tiers VTC + RC Pro">Tiers VTC + RC Pro Exploitation</option>
-                        <option value="Tous Risques VTC + RC Pro">Tous Risques VTC + RC Pro Exploitation</option>
+                        <option value="Tiers VTC + RC Pro">1. Tiers VTC + RC Pro</option>
+                        <option value="Tiers Étendu VTC + RC Pro">2. Tiers Étendu VTC + RC Pro</option>
+                        <option value="Tous Risques VTC + RC Pro">3. Tous Risques VTC + RC Pro</option>
                       </select>
                     </div>
 
@@ -2476,13 +3444,22 @@ export const LeadModal: React.FC<LeadModalProps> = ({
 
                     <div>
                       <label className="block text-xs font-bold text-slate-700 mb-1">
-                        {getCotisationLabel(vtcForm.fractionnement)}
+                        Cotisation Validée ({vtcForm.fractionnement})
                       </label>
                       <input
                         type="number"
-                        required
+                        step="0.01"
                         value={vtcForm.cotisationMontant}
-                        onChange={(e) => setVtcForm({ ...vtcForm, cotisationMontant: parseFloat(e.target.value) || 0 })}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 0;
+                          setVtcForm({
+                            ...vtcForm,
+                            cotisationMontant: val,
+                            ...(vtcForm.formuleSouhaitee === 'Tiers VTC + RC Pro' ? { cotisationTiersSimple: val } : {}),
+                            ...(vtcForm.formuleSouhaitee === 'Tiers Étendu VTC + RC Pro' ? { cotisationTiersEtendu: val } : {}),
+                            ...(vtcForm.formuleSouhaitee === 'Tous Risques VTC + RC Pro' ? { cotisationTousRisques: val } : {})
+                          });
+                        }}
                         className="w-full text-sm font-bold text-amber-900 p-2.5 rounded-lg border border-amber-300 bg-amber-50/50"
                         placeholder="165"
                       />
@@ -2596,6 +3573,17 @@ export const LeadModal: React.FC<LeadModalProps> = ({
                 </div>
               )}
             </>
+          )}
+
+          {/* ========================================================= */}
+          {/* ONGLET DOCUMENTS DU DOSSIER (COMMUN À TOUTES LES BRANCHES) */}
+          {/* ========================================================= */}
+          {currentTabLabels[activeTab] === 'Documents' && (
+            <LeadDocumentsTab
+              documents={documents}
+              onChangeDocuments={setDocuments}
+              leadType={leadType}
+            />
           )}
 
           {/* Modal Footer Controls */}

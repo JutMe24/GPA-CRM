@@ -4,6 +4,7 @@ import {
   Filter, 
   Plus, 
   FileSpreadsheet, 
+  FileText,
   LayoutList, 
   Kanban, 
   Car, 
@@ -11,14 +12,27 @@ import {
   Briefcase, 
   Clock, 
   PhoneCall, 
-  ChevronRight, 
   MoreVertical,
   SlidersHorizontal,
   ArrowUpDown,
-  Download
+  Download,
+  Calendar,
+  Mail,
+  Phone,
+  X,
+  Check,
+  AlertTriangle,
+  Paperclip,
+  Send
 } from 'lucide-react';
-import { Lead, LeadQualification, LeadStatus, LeadType, User } from '../types/crm';
+import { Lead, LeadQualification, LeadStatus, LeadType, User, CabinetInfo, getUserDisplayName, completeProchaineAction, cancelProchaineAction } from '../types/crm';
 import { exportLeadsToExcel } from '../utils/excel';
+import { matchLeadSearch } from '../utils/search';
+import { computeAllDuplicatesInList } from '../utils/duplicates';
+import { getAccessibleLeads } from '../utils/permissions';
+import { TelephonyModal } from './TelephonyModal';
+import { QuickEmailModal } from './QuickEmailModal';
+import { DevoirConseilModal } from './DevoirConseilModal';
 
 interface LeadsListProps {
   leads: Lead[];
@@ -29,7 +43,38 @@ interface LeadsListProps {
   onUpdateLead?: (lead: Lead) => void;
   initialProductFilter?: LeadType | 'ALL';
   currentUser?: User;
+  cabinetInfo?: CabinetInfo;
+  users?: User[];
 }
+
+const formatLeadDate = (dateStr?: string) => {
+  if (!dateStr) return '-';
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    return d.toLocaleDateString('fr-FR', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric'
+    });
+  } catch {
+    return dateStr;
+  }
+};
+
+const formatLeadTime = (dateStr?: string) => {
+  if (!dateStr) return '';
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString('fr-FR', {
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  } catch {
+    return '';
+  }
+};
 
 const getFractionnementSuffix = (fractionnement?: string) => {
   switch (fractionnement) {
@@ -54,33 +99,81 @@ export const LeadsList: React.FC<LeadsListProps> = ({
   onUpdateStatus,
   onUpdateLead,
   initialProductFilter = 'ALL',
-  currentUser
+  currentUser,
+  cabinetInfo,
+  users
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [productFilter, setProductFilter] = useState<LeadType | 'ALL'>(initialProductFilter);
   const [statusFilter, setStatusFilter] = useState<LeadStatus | 'ALL'>('ALL');
   const [viewMode, setViewMode] = useState<'table' | 'kanban'>('table');
+  const [showOnlyDuplicates, setShowOnlyDuplicates] = useState(false);
 
-  // Filtered Leads based on filters & user permissions
-  const filteredLeads = leads.filter((lead) => {
-    // Check view all permission / Team / Agent restriction
-    if (currentUser && !currentUser.permissions.canViewAllLeads) {
-      const attrib = (lead.attribueA || '').toLowerCase();
-      const leadEquipe = (lead.equipe || '').toLowerCase();
-      const userEquipe = (currentUser.equipe || '').toLowerCase();
-      const matchesUser = attrib.includes(currentUser.nom.toLowerCase()) || attrib.includes(currentUser.prenom.toLowerCase());
+  // Quick Action Direct Call, Direct Email, and Devoir de Conseil States
+  const [telephonyLead, setTelephonyLead] = useState<Lead | null>(null);
+  const [quickEmailLead, setQuickEmailLead] = useState<Lead | null>(null);
+  const [devoirConseilLead, setDevoirConseilLead] = useState<Lead | null>(null);
 
-      if (currentUser.role === 'AGENT_COMMERCIAL' || currentUser.role === 'COURTIER') {
-        // Agent commercial sees ONLY leads directly assigned to them
-        if (!matchesUser) return false;
-      } else if (currentUser.role === 'RESPONSABLE_EQUIPE' || currentUser.role === 'GESTIONNAIRE' || currentUser.role === 'MANAGER') {
-        // Responsable équipe & Gestionnaire see leads of their assigned team OR assigned to them
-        const matchesTeam = Boolean(userEquipe && leadEquipe && leadEquipe === userEquipe);
-        if (!matchesTeam && !matchesUser) return false;
-      } else {
-        // General fallback
-        if (!matchesUser) return false;
+  // Helper to format assigned agent name prioritizing pseudo
+  const getAgentName = React.useCallback((lead: Lead): string => {
+    const raw = (lead.attribueA || lead.assignedBroker || '').trim();
+    if (!raw) return 'Non assigné';
+    if (currentUser) {
+      if (
+        (currentUser.pseudo && raw.toLowerCase() === currentUser.pseudo.toLowerCase()) ||
+        (`${currentUser.prenom} ${currentUser.nom}`.toLowerCase() === raw.toLowerCase()) ||
+        currentUser.id === lead.assignedTo
+      ) {
+        return getUserDisplayName(currentUser);
       }
+    }
+    const matched = users?.find(
+      u => (u.pseudo && u.pseudo.toLowerCase() === raw.toLowerCase()) ||
+           (`${u.prenom} ${u.nom}`.toLowerCase() === raw.toLowerCase()) ||
+           getUserDisplayName(u).toLowerCase() === raw.toLowerCase() ||
+           u.id === lead.assignedTo
+    );
+    if (matched) return getUserDisplayName(matched);
+    return raw;
+  }, [currentUser, users]);
+
+  // Leads strictement accessibles selon le rôle et les attributions du compte connecté
+  const accessibleLeads = React.useMemo(() => {
+    return getAccessibleLeads(leads, currentUser, users);
+  }, [leads, currentUser, users]);
+
+  // Détection groupée des doublons dans les leads accessibles
+  const duplicatesMap = React.useMemo(() => computeAllDuplicatesInList(accessibleLeads), [accessibleLeads]);
+
+  const statusesOptions = React.useMemo(() => {
+    const list = cabinetInfo?.customStatuses && cabinetInfo.customStatuses.length > 0
+      ? [...cabinetInfo.customStatuses]
+      : [
+          { id: 'NOUVEAU', label: 'Nouveau Lead' },
+          { id: 'A_CONTACTER', label: 'À Contacter' },
+          { id: 'DEVIS_ENVOYE', label: 'Devis Envoyé' },
+          { id: 'RELANCE', label: 'Relance à faire' },
+          { id: 'PDG', label: 'PDG (Prise De Garantie)' },
+          { id: 'GAGNE', label: 'Souscrit / Gagné' },
+          { id: 'PERDU', label: 'Perdu / Rejeté' }
+        ];
+
+    if (!list.some((s) => s.id === 'PDG')) {
+      const gagneIdx = list.findIndex((s) => s.id === 'GAGNE');
+      if (gagneIdx !== -1) {
+        list.splice(gagneIdx, 0, { id: 'PDG', label: 'PDG (Prise De Garantie)' });
+      } else {
+        list.push({ id: 'PDG', label: 'PDG (Prise De Garantie)' });
+      }
+    }
+    return list;
+  }, [cabinetInfo?.customStatuses]);
+
+  // Filtered Leads based on accessible leads & active UI filters
+  const filteredLeads = accessibleLeads.filter((lead) => {
+    // Filtre doublons uniquement si activé
+    if (showOnlyDuplicates && !duplicatesMap.has(lead.id)) {
+      return false;
     }
 
     // Product match
@@ -89,23 +182,9 @@ export const LeadsList: React.FC<LeadsListProps> = ({
     // Status match
     if (statusFilter !== 'ALL' && lead.status !== statusFilter) return false;
 
-    // Search term match
+    // Search term match - Recherche universelle sans contrainte (téléphone sans espace, immatriculation sans tiret, accents, etc.)
     if (searchTerm.trim()) {
-      const term = searchTerm.toLowerCase();
-      const nameMatch = `${lead.prenom} ${lead.nom}`.toLowerCase().includes(term);
-      const phoneMatch = lead.telephone.includes(term);
-      const emailMatch = lead.email.toLowerCase().includes(term);
-      const refMatch = lead.referenceDevis.toLowerCase().includes(term);
-      const cityMatch = lead.ville.toLowerCase().includes(term);
-
-      let immatMatch = false;
-      if (lead.type === 'AUTO' && lead.autoDetails) {
-        immatMatch = lead.autoDetails.immatriculation.toLowerCase().includes(term);
-      } else if (lead.type === 'VTC' && lead.vtcDetails) {
-        immatMatch = lead.vtcDetails.immatriculation.toLowerCase().includes(term);
-      }
-
-      return nameMatch || phoneMatch || emailMatch || refMatch || cityMatch || immatMatch;
+      return matchLeadSearch(lead, searchTerm);
     }
 
     return true;
@@ -121,35 +200,33 @@ export const LeadsList: React.FC<LeadsListProps> = ({
         return 'bg-purple-100 text-purple-800 border-purple-200';
       case 'RELANCE':
         return 'bg-orange-100 text-orange-800 border-orange-200';
+      case 'PDG':
+        return 'bg-indigo-100 text-indigo-900 border-indigo-300 font-bold';
       case 'GAGNE':
         return 'bg-emerald-100 text-emerald-800 border-emerald-200';
       case 'PERDU':
         return 'bg-rose-100 text-rose-800 border-rose-200';
       default:
-        return 'bg-slate-100 text-slate-800';
+        return 'bg-indigo-100 text-indigo-800 border-indigo-200';
     }
   };
 
   const getStatusLabel = (status: LeadStatus) => {
+    const custom = statusesOptions.find(s => s.id === status);
+    if (custom) return custom.label;
     switch (status) {
       case 'NOUVEAU': return 'Nouveau Lead';
       case 'A_CONTACTER': return 'À Contacter';
       case 'DEVIS_ENVOYE': return 'Devis Envoyé';
       case 'RELANCE': return 'Relance à faire';
+      case 'PDG': return 'PDG (Prise De Garantie)';
       case 'GAGNE': return 'Souscrit / Gagné';
       case 'PERDU': return 'Perdu / Rejeté';
       default: return status;
     }
   };
 
-  const kanbanColumns: LeadStatus[] = [
-    'NOUVEAU',
-    'A_CONTACTER',
-    'DEVIS_ENVOYE',
-    'RELANCE',
-    'GAGNE',
-    'PERDU'
-  ];
+  const kanbanColumns: LeadStatus[] = statusesOptions.map(s => s.id);
 
   return (
     <div className="space-y-6 pb-12">
@@ -158,15 +235,25 @@ export const LeadsList: React.FC<LeadsListProps> = ({
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           
           {/* Search Box */}
-          <div className="relative flex-1 max-w-md">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-3" />
+          <div className="relative flex-1 max-w-xl">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-3 pointer-events-none" />
             <input
               type="text"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder="Rechercher par nom, téléphone, immatriculation, ville, réf..."
-              className="w-full text-xs pl-10 pr-4 py-2.5 rounded-xl border border-slate-300 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-slate-50/50"
+              placeholder="Recherche sans contrainte (téléphone sans espace, plaque sans tiret, nom, ville, réf...)"
+              className="w-full text-xs pl-10 pr-9 py-2.5 rounded-xl border border-slate-300 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-slate-50/50"
             />
+            {searchTerm && (
+              <button
+                type="button"
+                onClick={() => setSearchTerm('')}
+                className="absolute right-2.5 top-2.5 p-0.5 text-slate-400 hover:text-slate-700 rounded-md hover:bg-slate-200 transition cursor-pointer"
+                title="Effacer la recherche"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            )}
           </div>
 
           {/* Action Buttons & View Switcher */}
@@ -257,29 +344,55 @@ export const LeadsList: React.FC<LeadsListProps> = ({
             ))}
           </div>
 
-          {/* Status Filter */}
-          <div className="flex items-center space-x-1 overflow-x-auto py-0.5">
-            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mr-2">Statut :</span>
-            <select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as any)}
-              className="text-xs font-bold bg-slate-100 text-slate-800 p-1.5 rounded-xl border border-slate-200 focus:outline-none"
-            >
-              <option value="ALL">Tous les statuts</option>
-              <option value="NOUVEAU">Nouveau Lead</option>
-              <option value="A_CONTACTER">À Contacter</option>
-              <option value="DEVIS_ENVOYE">Devis Envoyé</option>
-              <option value="RELANCE">Relance à faire</option>
-              <option value="GAGNE">Gagné / Souscrit</option>
-              <option value="PERDU">Perdu</option>
-            </select>
+          {/* Status & Duplicates Filters */}
+          <div className="flex items-center space-x-2 overflow-x-auto py-0.5">
+            {duplicatesMap.size > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowOnlyDuplicates(!showOnlyDuplicates)}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center gap-1.5 border cursor-pointer ${
+                  showOnlyDuplicates
+                    ? 'bg-amber-500 text-white border-amber-600 shadow-xs'
+                    : 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300'
+                }`}
+                title="Filtrer uniquement les dossiers identifiés comme doublons"
+              >
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span>Doublons ({duplicatesMap.size})</span>
+              </button>
+            )}
+
+            <div className="flex items-center space-x-1">
+              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mr-1">Statut :</span>
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value as any)}
+                className="text-xs font-bold bg-slate-100 text-slate-800 p-1.5 rounded-xl border border-slate-200 focus:outline-none"
+              >
+                <option value="ALL">Tous les statuts</option>
+                {statusesOptions.map(st => (
+                  <option key={st.id} value={st.id}>{st.label}</option>
+                ))}
+              </select>
+            </div>
           </div>
         </div>
       </div>
 
       {/* RESULT COUNTER */}
-      <div className="flex items-center justify-between text-xs text-slate-500 font-medium px-1">
-        <span>Affichage de <strong>{filteredLeads.length}</strong> dossier(s) sur {leads.length} au total</span>
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 font-medium px-1">
+        <div className="flex items-center gap-2">
+          <span>
+            Affichage de <strong>{filteredLeads.length}</strong> dossier(s) sur{' '}
+            <strong>{accessibleLeads.length}</strong>{' '}
+            {currentUser?.permissions?.canViewAllLeads ? 'au total dans le cabinet' : 'dossier(s) attribué(s) à votre compte'}
+          </span>
+          {currentUser && !currentUser.permissions?.canViewAllLeads && (
+            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+              🔒 Vos dossiers uniquement
+            </span>
+          )}
+        </div>
       </div>
 
       {/* VIEW MODE 1: TABLE VIEW */}
@@ -287,21 +400,22 @@ export const LeadsList: React.FC<LeadsListProps> = ({
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
-              <thead className="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b border-slate-200">
+              <thead className="bg-slate-50 text-slate-600 font-bold uppercase tracking-wider border-b border-slate-200">
                 <tr>
-                  <th className="p-4">Réf & Prospect</th>
-                  <th className="p-4">Branche Produit</th>
+                  <th className="p-4 whitespace-nowrap">Date d'Ajout</th>
+                  <th className="p-4">Prospect</th>
                   <th className="p-4">Coordonnées</th>
-                  <th className="p-4">Cotisation Prévue</th>
-                  <th className="p-4">Statut & Qualif</th>
+                  <th className="p-4">Cotisation / Formule</th>
+                  <th className="p-4">Statut</th>
+                  <th className="p-4">Agent Assigné</th>
                   <th className="p-4">Prochaine Action</th>
-                  <th className="p-4 text-right">Action</th>
+                  <th className="p-4 text-center whitespace-nowrap w-24">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredLeads.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="p-12 text-center text-slate-400">
+                    <td colSpan={8} className="p-12 text-center text-slate-400">
                       Aucun lead d'assurance ne correspond à vos critères de recherche.
                     </td>
                   </tr>
@@ -329,128 +443,242 @@ export const LeadsList: React.FC<LeadsListProps> = ({
                       immatOrDetail = lead.vtcDetails.immatriculation;
                     }
 
+                    if (fractionnement === 'Mensuel' && cotis > 300) {
+                      cotis = Math.round((cotis / 12) * 100) / 100;
+                    }
+
+                    const agentName = getAgentName(lead);
+
                     return (
                       <tr 
                         key={`lead-row-${lead.id}-${idx}`}
                         onClick={() => onSelectLead(lead)}
                         className="hover:bg-slate-50/80 transition cursor-pointer group"
                       >
-                        <td className="p-4">
-                          <div className="font-bold text-slate-900 group-hover:text-blue-600 transition">
-                            {lead.prenom} {lead.nom}
+                        {/* 1. Date d'ajout du lead */}
+                        <td className="p-4 whitespace-nowrap">
+                          <div className="font-semibold text-slate-800 text-xs flex items-center gap-1.5">
+                            <Calendar className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                            <span>{formatLeadDate(lead.createdAt)}</span>
                           </div>
-                          <div className="flex items-center gap-1.5 mt-0.5">
-                            <span className="text-[10px] font-mono text-slate-400">
-                              {lead.referenceDevis}
-                            </span>
-                            {(lead.attribueA || lead.assignedBroker) && (
-                              <span className="text-[10px] bg-indigo-50 text-indigo-700 font-bold px-1.5 py-0.2 rounded border border-indigo-200/60">
-                                👤 {lead.attribueA || lead.assignedBroker}
-                              </span>
-                            )}
-                          </div>
+                          {formatLeadTime(lead.createdAt) && (
+                            <div className="text-[10px] text-slate-400 font-mono pl-5 mt-0.5">
+                              à {formatLeadTime(lead.createdAt)}
+                            </div>
+                          )}
                         </td>
 
+                        {/* 2. Prospect */}
                         <td className="p-4">
-                          <div className="flex items-center space-x-1.5">
-                            <span className={`inline-flex items-center px-2 py-0.5 rounded-lg text-[10px] font-bold ${
+                          <div className="font-bold text-slate-900 group-hover:text-blue-600 transition text-xs">
+                            {lead.civilite ? `${lead.civilite} ` : ''}{lead.nom ? lead.nom.toUpperCase() : ''} {lead.prenom}
+                          </div>
+                          <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                            <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold ${
                               lead.type === 'AUTO' ? 'bg-blue-100 text-blue-800' :
                               lead.type === 'HABITATION' ? 'bg-emerald-100 text-emerald-800' :
                               'bg-amber-100 text-amber-800'
                             }`}>
                               {lead.type}
                             </span>
+                            {immatOrDetail && (
+                              <span className="text-[10px] text-slate-500 font-mono">
+                                • {immatOrDetail}
+                              </span>
+                            )}
+                            {duplicatesMap.has(lead.id) && (
+                              <span
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-black bg-amber-100 text-amber-900 border border-amber-300"
+                                title={`Doublon potentiel détecté:\n${duplicatesMap.get(lead.id)?.map(r => `• ${r.label} (${r.matchedValue})`).join('\n')}`}
+                              >
+                                <AlertTriangle className="w-2.5 h-2.5 text-amber-700" />
+                                <span>Doublon</span>
+                              </span>
+                            )}
+                            {lead.documents && lead.documents.length > 0 && (
+                              <span
+                                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-50 text-blue-700 border border-blue-200"
+                                title={`${lead.documents.length} document(s) joint(s)`}
+                              >
+                                <Paperclip className="w-2.5 h-2.5" />
+                                <span>{lead.documents.length}</span>
+                              </span>
+                            )}
                           </div>
-                          <div className="text-[10px] text-slate-500 mt-1">{immatOrDetail}</div>
                         </td>
 
+                        {/* 3. Coordonnées (email et tel) */}
                         <td className="p-4">
-                          <div className="font-mono font-semibold text-slate-800 text-[11px]">
-                            {lead.telephone}
+                          <div className="font-mono font-semibold text-slate-800 text-xs flex items-center gap-1.5">
+                            <Phone className="w-3 h-3 text-slate-400 shrink-0" />
+                            <span>{lead.telephone || '-'}</span>
                           </div>
-                          <div className="text-[10px] text-slate-500">{lead.email}</div>
+                          <div className="text-[11px] text-slate-500 flex items-center gap-1.5 mt-0.5 max-w-[200px] truncate" title={lead.email}>
+                            <Mail className="w-3 h-3 text-slate-400 shrink-0" />
+                            <span className="truncate">{lead.email || '-'}</span>
+                          </div>
                         </td>
 
+                        {/* 4. Cotisation / Formule */}
                         <td className="p-4">
                           <div className="font-bold text-emerald-800 text-xs">
                             {cotis > 0 ? `${cotis.toLocaleString('fr-FR')} € ${getFractionnementSuffix(fractionnement)}` : '-'}
                           </div>
-                          <div className="text-[10px] text-slate-400">{formula}</div>
+                          <div className="text-[11px] text-slate-600 font-medium mt-0.5 line-clamp-1" title={formula}>
+                            {formula}
+                          </div>
                         </td>
 
+                        {/* 5. Statut */}
                         <td className="p-4" onClick={(e) => e.stopPropagation()}>
-                          <div className="flex flex-col gap-1.5 items-start">
-                            {/* Direct Status Selector */}
-                            <select
-                              value={lead.status}
-                              onChange={(e) => {
-                                const newStatus = e.target.value as LeadStatus;
-                                if (onUpdateLead) {
-                                  onUpdateLead({
-                                    ...lead,
-                                    status: newStatus,
-                                    updatedAt: new Date().toISOString()
-                                  });
-                                } else {
-                                  onUpdateStatus(lead.id, newStatus);
-                                }
-                              }}
-                              className={`text-[10px] font-bold px-2 py-0.5 rounded-full border cursor-pointer outline-none transition shadow-2xs ${getStatusBadgeClass(lead.status)}`}
-                            >
-                              <option value="NOUVEAU">Nouveau Lead</option>
-                              <option value="A_CONTACTER">À Contacter</option>
-                              <option value="DEVIS_ENVOYE">Devis Envoyé</option>
-                              <option value="RELANCE">Relance à faire</option>
-                              <option value="GAGNE">Souscrit / Gagné</option>
-                              <option value="PERDU">Perdu / Rejeté</option>
-                            </select>
+                          <select
+                            value={lead.status}
+                            onChange={(e) => {
+                              const newStatus = e.target.value as LeadStatus;
+                              if (onUpdateLead) {
+                                onUpdateLead({
+                                  ...lead,
+                                  status: newStatus,
+                                  updatedAt: new Date().toISOString()
+                                });
+                              } else {
+                                onUpdateStatus(lead.id, newStatus);
+                              }
+                            }}
+                            className={`text-[10px] font-bold px-2.5 py-1 rounded-full border cursor-pointer outline-none transition shadow-2xs ${getStatusBadgeClass(lead.status)}`}
+                          >
+                            {statusesOptions.map(st => (
+                              <option key={st.id} value={st.id}>{st.label}</option>
+                            ))}
+                          </select>
+                        </td>
 
-                            {/* Direct Qualification Selector */}
-                            <select
-                              value={lead.qualification || 'CHAUD'}
-                              onChange={(e) => {
-                                const newQualif = e.target.value as LeadQualification;
-                                if (onUpdateLead) {
-                                  onUpdateLead({
-                                    ...lead,
-                                    qualification: newQualif,
-                                    updatedAt: new Date().toISOString()
-                                  });
-                                }
-                              }}
-                              className="text-[10px] font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-md px-1.5 py-0.5 cursor-pointer outline-none transition"
-                            >
-                              <option value="CHAUD">🔥 Chaud</option>
-                              <option value="TIEDE">⚡ Tiède</option>
-                              <option value="FROID">❄️ Froid</option>
-                              <option value="HORS_CIBLE">🚫 Hors Cible</option>
-                              <option value="INJOIGNABLE">📞 Injoignable</option>
-                            </select>
+                        {/* 6. Agent Assigné */}
+                        <td className="p-4 whitespace-nowrap">
+                          <div className="flex items-center gap-2">
+                            <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold text-[10px] shrink-0 border border-indigo-200">
+                              {agentName !== 'Non assigné' ? (agentName[0] || 'A').toUpperCase() : '?'}
+                            </div>
+                            <div>
+                              <div className="font-semibold text-slate-900 text-xs">
+                                {agentName}
+                              </div>
+                              {lead.equipe && (
+                                <div className="text-[10px] text-slate-400 font-medium">
+                                  {lead.equipe}
+                                </div>
+                              )}
+                            </div>
                           </div>
                         </td>
 
-                        <td className="p-4">
-                          <div className="font-medium text-slate-800 text-xs line-clamp-1">
-                            {lead.prochaineActionIntitule || '-'}
-                          </div>
-                          {lead.prochaineActionDate && (
-                            <div className="text-[10px] font-mono text-amber-700 font-semibold flex items-center gap-1 mt-0.5">
-                              <Clock className="w-3 h-3" />
-                              {lead.prochaineActionDate} {lead.prochaineActionHeure && `a ${lead.prochaineActionHeure}`}
+                        {/* 7. Prochaine Action */}
+                        <td className="p-4 max-w-[240px]">
+                          {lead.prochaineActionIntitule || lead.prochaineActionDate ? (
+                            <div className="space-y-1">
+                              <div className="flex items-center justify-between gap-1.5">
+                                <div className="font-medium text-slate-800 text-xs truncate" title={lead.prochaineActionIntitule || 'Rappel client'}>
+                                  📌 {lead.prochaineActionIntitule || 'Rappel client'}
+                                </div>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const author = currentUser ? getUserDisplayName(currentUser) : 'Conseiller';
+                                      onUpdateLead(completeProchaineAction(lead, author));
+                                    }}
+                                    className="p-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-md border border-emerald-200 transition cursor-pointer shadow-2xs"
+                                    title="Cocher que c'est fait"
+                                  >
+                                    <Check className="w-3.5 h-3.5" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const author = currentUser ? getUserDisplayName(currentUser) : 'Conseiller';
+                                      onUpdateLead(cancelProchaineAction(lead, author));
+                                    }}
+                                    className="p-1 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-md border border-rose-200 transition cursor-pointer shadow-2xs"
+                                    title="Annuler l'action"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </div>
+                              {lead.prochaineActionDate && (
+                                <div className="text-[10px] font-mono text-amber-800 font-semibold flex items-center gap-1">
+                                  <Clock className="w-3 h-3 text-amber-600 shrink-0" />
+                                  <span>{lead.prochaineActionDate} {lead.prochaineActionHeure && `à ${lead.prochaineActionHeure}`}</span>
+                                </div>
+                              )}
                             </div>
+                          ) : (
+                            <span className="text-slate-400 italic text-xs">Aucune action</span>
                           )}
                         </td>
 
-                        <td className="p-4 text-right">
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              onSelectLead(lead);
-                            }}
-                            className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition"
-                          >
-                            <ChevronRight className="w-5 h-5" />
-                          </button>
+                        {/* 8. Contact & Actions Rapides : Icône Téléphone et Icône Email directs (sans texte) */}
+                        <td className="p-4 whitespace-nowrap text-center" onClick={(e) => e.stopPropagation()}>
+                          <div className="flex items-center justify-center gap-1.5">
+                            {/* Icône Appel Direct */}
+                            {lead.telephone ? (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setTelephonyLead(lead);
+                                }}
+                                title={`Appeler ${lead.civilite || ''} ${lead.prenom} ${lead.nom} (${lead.telephone})`}
+                                className="w-8 h-8 rounded-xl bg-emerald-50 hover:bg-emerald-600 text-emerald-600 hover:text-white border border-emerald-200 hover:border-emerald-600 flex items-center justify-center transition shadow-2xs cursor-pointer group/tel"
+                              >
+                                <PhoneCall className="w-4 h-4 group-hover/tel:scale-110 transition-transform" />
+                              </button>
+                            ) : (
+                              <span
+                                title="Aucun numéro de téléphone"
+                                className="w-8 h-8 rounded-xl bg-slate-50 text-slate-300 border border-slate-200 flex items-center justify-center cursor-not-allowed"
+                              >
+                                <PhoneCall className="w-4 h-4" />
+                              </span>
+                            )}
+
+                            {/* Icône Email Direct */}
+                            {lead.email ? (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setQuickEmailLead(lead);
+                                }}
+                                title={`Envoyer un email à ${lead.email}`}
+                                className="w-8 h-8 rounded-xl bg-blue-50 hover:bg-blue-600 text-blue-600 hover:text-white border border-blue-200 hover:border-blue-600 flex items-center justify-center transition shadow-2xs cursor-pointer group/mail"
+                              >
+                                <Mail className="w-4 h-4 group-hover/mail:scale-110 transition-transform" />
+                              </button>
+                            ) : (
+                              <span
+                                title="Aucune adresse email"
+                                className="w-8 h-8 rounded-xl bg-slate-50 text-slate-300 border border-slate-200 flex items-center justify-center cursor-not-allowed"
+                              >
+                                <Mail className="w-4 h-4" />
+                              </span>
+                            )}
+
+                            {/* Icône Devoir de Conseil Direct */}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDevoirConseilLead(lead);
+                              }}
+                              title={`Générer ou imprimer le Devoir de Conseil officiel (${lead.nom} ${lead.prenom})`}
+                              className="w-8 h-8 rounded-xl bg-indigo-50 hover:bg-indigo-600 text-indigo-600 hover:text-white border border-indigo-200 hover:border-indigo-600 flex items-center justify-center transition shadow-2xs cursor-pointer group/dc"
+                            >
+                              <FileText className="w-4 h-4 group-hover/dc:scale-110 transition-transform" />
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );
@@ -493,54 +721,111 @@ export const LeadsList: React.FC<LeadsListProps> = ({
                     colLeads.map((lead, idx) => {
                       let cotis = 0;
                       let fractionnement = 'Mensuel';
+                      let formula = '';
                       if (lead.type === 'AUTO' && lead.autoDetails) {
                         cotis = lead.autoDetails.cotisationMontant;
                         fractionnement = lead.autoDetails.fractionnement || 'Mensuel';
+                        formula = lead.autoDetails.formuleSouhaitee;
                       } else if (lead.type === 'HABITATION' && lead.habitationDetails) {
                         cotis = lead.habitationDetails.cotisationMontant;
                         fractionnement = lead.habitationDetails.fractionnement || 'Mensuel';
+                        formula = lead.habitationDetails.formuleSouhaitee;
                       } else if (lead.type === 'VTC' && lead.vtcDetails) {
                         cotis = lead.vtcDetails.cotisationMontant;
                         fractionnement = lead.vtcDetails.fractionnement || 'Mensuel';
+                        formula = lead.vtcDetails.formuleSouhaitee;
                       }
+
+                      if (fractionnement === 'Mensuel' && cotis > 300) {
+                        cotis = Math.round((cotis / 12) * 100) / 100;
+                      }
+
+                      const agentName = getAgentName(lead);
 
                       return (
                         <div
                           key={`lead-kanban-${lead.id}-${idx}`}
                           onClick={() => onSelectLead(lead)}
-                          className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs hover:shadow-md transition cursor-pointer space-y-2 group"
+                          className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs hover:shadow-md transition cursor-pointer space-y-2.5 group"
                         >
-                          <div className="flex items-center justify-between">
-                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
-                              lead.type === 'AUTO' ? 'bg-blue-100 text-blue-800' :
-                              lead.type === 'HABITATION' ? 'bg-emerald-100 text-emerald-800' :
-                              'bg-amber-100 text-amber-800'
-                            }`}>
-                              {lead.type}
+                          <div className="flex items-center justify-between text-[10px] text-slate-400">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
+                                lead.type === 'AUTO' ? 'bg-blue-100 text-blue-800' :
+                                lead.type === 'HABITATION' ? 'bg-emerald-100 text-emerald-800' :
+                                'bg-amber-100 text-amber-800'
+                              }`}>
+                                {lead.type}
+                              </span>
+                              {duplicatesMap.has(lead.id) && (
+                                <span
+                                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-black bg-amber-100 text-amber-900 border border-amber-300"
+                                  title={`Doublon potentiel détecté:\n${duplicatesMap.get(lead.id)?.map(r => `• ${r.label} (${r.matchedValue})`).join('\n')}`}
+                                >
+                                  <AlertTriangle className="w-2.5 h-2.5 text-amber-700" />
+                                  <span>Doublon</span>
+                                </span>
+                              )}
+                              {lead.documents && lead.documents.length > 0 && (
+                                <span
+                                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-50 text-blue-700 border border-blue-200"
+                                  title={`${lead.documents.length} document(s) joint(s)`}
+                                >
+                                  <Paperclip className="w-2.5 h-2.5" />
+                                  <span>{lead.documents.length}</span>
+                                </span>
+                              )}
+                            </div>
+                            <span className="font-mono flex items-center gap-1">
+                              <Calendar className="w-3 h-3 text-slate-400" />
+                              {formatLeadDate(lead.createdAt)}
                             </span>
-                            <span className="text-[10px] font-mono text-slate-400">{lead.referenceDevis}</span>
                           </div>
 
                           <div>
-                            <h4 className="font-bold text-xs text-slate-900 group-hover:text-blue-600 transition flex items-center justify-between">
-                              <span>{lead.prenom} {lead.nom}</span>
-                              {(lead.attribueA || lead.assignedBroker) && (
-                                <span className="text-[9px] bg-indigo-50 text-indigo-700 font-bold px-1.5 py-0.2 rounded border border-indigo-200/60">
-                                  👤 {lead.attribueA || lead.assignedBroker}
-                                </span>
-                              )}
+                            <h4 className="font-bold text-xs text-slate-900 group-hover:text-blue-600 transition">
+                              {lead.civilite ? `${lead.civilite} ` : ''}{lead.nom ? lead.nom.toUpperCase() : ''} {lead.prenom}
                             </h4>
-                            <p className="text-[11px] text-slate-500 font-mono">{lead.telephone}</p>
                           </div>
 
-                          {cotis > 0 && (
-                            <div className="text-xs font-bold text-emerald-700 pt-1 border-t border-slate-100 flex items-center justify-between">
-                              <span>{cotis.toLocaleString('fr-FR')} € {getFractionnementSuffix(fractionnement)}</span>
+                          {/* Coordonnées */}
+                          <div className="text-[11px] space-y-0.5 text-slate-600 border-t border-slate-100 pt-1.5">
+                            <div className="flex items-center gap-1 font-mono font-medium text-slate-800">
+                              <Phone className="w-3 h-3 text-slate-400 shrink-0" />
+                              <span>{lead.telephone || '-'}</span>
+                            </div>
+                            <div className="flex items-center gap-1 text-[10px] text-slate-500 truncate" title={lead.email}>
+                              <Mail className="w-3 h-3 text-slate-400 shrink-0" />
+                              <span className="truncate">{lead.email || '-'}</span>
+                            </div>
+                          </div>
+
+                          {/* Cotisation / Formule */}
+                          {(cotis > 0 || formula) && (
+                            <div className="pt-1.5 border-t border-slate-100">
+                              {cotis > 0 && (
+                                <div className="text-xs font-bold text-emerald-700">
+                                  {cotis.toLocaleString('fr-FR')} € {getFractionnementSuffix(fractionnement)}
+                                </div>
+                              )}
+                              <div className="text-[10px] text-slate-500 truncate" title={formula}>
+                                {formula}
+                              </div>
                             </div>
                           )}
 
-                          {/* Quick Qualification & Status change in Kanban */}
-                          <div className="flex items-center justify-between gap-1 pt-1 border-t border-slate-100" onClick={(e) => e.stopPropagation()}>
+                          {/* Agent Assigné */}
+                          <div className="flex items-center gap-1.5 pt-1.5 border-t border-slate-100">
+                            <div className="w-5 h-5 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center font-bold text-[9px] shrink-0 border border-indigo-200">
+                              {agentName !== 'Non assigné' ? (agentName[0] || 'A').toUpperCase() : '?'}
+                            </div>
+                            <span className="text-[11px] font-medium text-slate-700 truncate">
+                              {agentName}
+                            </span>
+                          </div>
+
+                          {/* Statut Selector in Kanban */}
+                          <div className="pt-1 border-t border-slate-100" onClick={(e) => e.stopPropagation()}>
                             <select
                               value={lead.status}
                               onChange={(e) => {
@@ -551,39 +836,82 @@ export const LeadsList: React.FC<LeadsListProps> = ({
                                   onUpdateStatus(lead.id, newStatus);
                                 }
                               }}
-                              className={`text-[9px] font-bold px-1.5 py-0.5 rounded border cursor-pointer outline-none ${getStatusBadgeClass(lead.status)}`}
+                              className={`w-full text-[10px] font-bold px-2 py-1 rounded-lg border cursor-pointer outline-none ${getStatusBadgeClass(lead.status)}`}
                             >
-                              <option value="NOUVEAU">Nouveau</option>
-                              <option value="A_CONTACTER">À Contacter</option>
-                              <option value="DEVIS_ENVOYE">Devis Envoyé</option>
-                              <option value="RELANCE">Relance</option>
-                              <option value="GAGNE">Gagné</option>
-                              <option value="PERDU">Perdu</option>
-                            </select>
-
-                            <select
-                              value={lead.qualification || 'CHAUD'}
-                              onChange={(e) => {
-                                const newQualif = e.target.value as LeadQualification;
-                                if (onUpdateLead) {
-                                  onUpdateLead({ ...lead, qualification: newQualif, updatedAt: new Date().toISOString() });
-                                }
-                              }}
-                              className="text-[9px] font-bold text-slate-700 bg-slate-100 border border-slate-200 rounded px-1.5 py-0.5 cursor-pointer outline-none"
-                            >
-                              <option value="CHAUD">🔥 Chaud</option>
-                              <option value="TIEDE">⚡ Tiède</option>
-                              <option value="FROID">❄️ Froid</option>
-                              <option value="HORS_CIBLE">🚫 Hors Cible</option>
-                              <option value="INJOIGNABLE">📞 Injoignable</option>
+                              {statusesOptions.map(st => (
+                                <option key={st.id} value={st.id}>{st.label}</option>
+                              ))}
                             </select>
                           </div>
 
-                          {lead.prochaineActionIntitule && (
-                            <div className="text-[10px] text-slate-600 bg-amber-50 p-1.5 rounded border border-amber-200">
-                              <p className="font-medium line-clamp-1">📌 {lead.prochaineActionIntitule}</p>
+                          {/* Prochaine Action */}
+                          {(lead.prochaineActionIntitule || lead.prochaineActionDate) && (
+                            <div className="text-[10px] text-slate-700 bg-amber-50 p-2 rounded-lg border border-amber-200 space-y-1">
+                              <div className="flex items-center justify-between gap-1">
+                                <p className="font-semibold line-clamp-1 text-slate-900">📌 {lead.prochaineActionIntitule || 'Rappel client'}</p>
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const author = currentUser ? getUserDisplayName(currentUser) : 'Conseiller';
+                                      onUpdateLead(completeProchaineAction(lead, author));
+                                    }}
+                                    className="p-1 bg-white hover:bg-emerald-100 text-emerald-700 rounded border border-emerald-300 transition cursor-pointer"
+                                    title="Cocher que c'est fait"
+                                  >
+                                    <Check className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const author = currentUser ? getUserDisplayName(currentUser) : 'Conseiller';
+                                      onUpdateLead(cancelProchaineAction(lead, author));
+                                    }}
+                                    className="p-1 bg-white hover:bg-rose-100 text-rose-700 rounded border border-rose-300 transition cursor-pointer"
+                                    title="Annuler l'action"
+                                  >
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              </div>
+                              {lead.prochaineActionDate && (
+                                <p className="text-[9px] font-mono text-amber-800 font-bold">
+                                  {lead.prochaineActionDate} {lead.prochaineActionHeure && `à ${lead.prochaineActionHeure}`}
+                                </p>
+                              )}
                             </div>
                           )}
+
+                          {/* Quick Direct Actions in Kanban (Icons only) */}
+                          <div className="pt-2 border-t border-slate-100 flex items-center justify-end gap-1.5" onClick={(e) => e.stopPropagation()}>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (lead.telephone) setTelephonyLead(lead);
+                              }}
+                              disabled={!lead.telephone}
+                              title={lead.telephone ? `Appeler ${lead.telephone}` : 'Pas de numéro'}
+                              className="p-1.5 bg-emerald-50 hover:bg-emerald-600 text-emerald-600 hover:text-white disabled:opacity-30 disabled:hover:bg-emerald-50 disabled:hover:text-emerald-600 disabled:cursor-not-allowed border border-emerald-200 rounded-lg transition cursor-pointer"
+                            >
+                              <PhoneCall className="w-3.5 h-3.5" />
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (lead.email) setQuickEmailLead(lead);
+                              }}
+                              disabled={!lead.email}
+                              title={lead.email ? `Email à ${lead.email}` : 'Pas d\'email'}
+                              className="p-1.5 bg-blue-50 hover:bg-blue-600 text-blue-600 hover:text-white disabled:opacity-30 disabled:hover:bg-blue-50 disabled:hover:text-blue-600 disabled:cursor-not-allowed border border-blue-200 rounded-lg transition cursor-pointer"
+                            >
+                              <Mail className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
                       );
                     })
@@ -593,6 +921,49 @@ export const LeadsList: React.FC<LeadsListProps> = ({
             );
           })}
         </div>
+      )}
+
+      {/* Telephony Modal (Direct Call Console without entering lead) */}
+      {telephonyLead && (
+        <TelephonyModal
+          isOpen={!!telephonyLead}
+          onClose={() => setTelephonyLead(null)}
+          lead={telephonyLead}
+          currentUser={currentUser}
+          cabinetInfo={cabinetInfo}
+          onUpdateLead={(updated) => {
+            if (onUpdateLead) onUpdateLead(updated);
+            setTelephonyLead(updated);
+          }}
+        />
+      )}
+
+      {/* Quick Email Modal (Direct Email Sending without entering lead) */}
+      {quickEmailLead && (
+        <QuickEmailModal
+          isOpen={!!quickEmailLead}
+          onClose={() => setQuickEmailLead(null)}
+          lead={quickEmailLead}
+          currentUser={currentUser}
+          cabinetInfo={cabinetInfo}
+          onUpdateLead={onUpdateLead}
+          onUpdateStatus={onUpdateStatus}
+        />
+      )}
+
+      {/* Official Devoir de Conseil (DDA 2026) Direct Modal */}
+      {devoirConseilLead && cabinetInfo && (
+        <DevoirConseilModal
+          isOpen={!!devoirConseilLead}
+          onClose={() => setDevoirConseilLead(null)}
+          lead={devoirConseilLead}
+          cabinetInfo={cabinetInfo}
+          currentUser={currentUser}
+          onUpdateLead={(updated) => {
+            if (onUpdateLead) onUpdateLead(updated);
+            setDevoirConseilLead(updated);
+          }}
+        />
       )}
     </div>
   );

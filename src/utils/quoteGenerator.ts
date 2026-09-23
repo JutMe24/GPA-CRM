@@ -35,13 +35,22 @@ export function getQuotePricing(lead: Lead) {
     options = lead.vtcDetails.optionsSupplementaires || [];
   }
 
+  const isMensuel = fractionnement.toLowerCase().includes('mensuel');
+  const isTrimestriel = fractionnement.toLowerCase().includes('trimestriel');
+  const isSemestriel = fractionnement.toLowerCase().includes('semestriel');
+
+  // Si le fractionnement est mensuel et que la valeur historique était en annuel (> 300)
+  if (isMensuel && cotisation > 300) {
+    cotisation = Math.round((cotisation / 12) * 100) / 100;
+  }
+
   // Calculate annual equivalent if fractionnement is given
   let cotisationAnnee = cotisation;
-  if (fractionnement === 'Mensuel') cotisationAnnee = cotisation * 12;
-  else if (fractionnement === 'Trimestriel') cotisationAnnee = cotisation * 4;
-  else if (fractionnement === 'Semestriel') cotisationAnnee = cotisation * 2;
+  if (isMensuel) cotisationAnnee = Math.round(cotisation * 12 * 100) / 100;
+  else if (isTrimestriel) cotisationAnnee = Math.round(cotisation * 4 * 100) / 100;
+  else if (isSemestriel) cotisationAnnee = Math.round(cotisation * 2 * 100) / 100;
 
-  return { formula, fractionnement, cotisation, cotisationAnnee, fraisDossier, options };
+  return { formula, fractionnement, cotisation, cotisationAnnee, fraisDossier, options, isMensuel };
 }
 
 export interface GuaranteeItem {
@@ -105,9 +114,9 @@ export function getGuaranteesList(lead: Lead): GuaranteeItem[] {
 /**
  * Generates a complete, professional structured Text document for email quote attachment
  */
-export function generateProfessionalQuoteText(lead: Lead, cabinetInfo: CabinetInfo): string {
+export function generateProfessionalQuoteText(lead: Lead, cabinetInfo: CabinetInfo, advisorName?: string): string {
   const civility = getLeadCivility(lead);
-  const { formula, fractionnement, cotisation, cotisationAnnee, fraisDossier, options } = getQuotePricing(lead);
+  const { formula, fractionnement, cotisation, cotisationAnnee, fraisDossier, options, isMensuel } = getQuotePricing(lead);
   const guarantees = getGuaranteesList(lead);
 
   const dateNow = new Date().toLocaleDateString('fr-FR');
@@ -239,7 +248,7 @@ CABINET EMETTEUR :
   Adresse             : ${cabinetInfo.adresse} - ${cabinetInfo.codePostal} ${cabinetInfo.ville}
   N° ORIAS            : ${cabinetInfo.numeroOrias}
   Téléphone / Email   : ${cabinetInfo.telephone} | ${cabinetInfo.emailContact || cabinetInfo.nomCourtierPrincipal}
-  Courtier Référent   : ${cabinetInfo.nomCourtierPrincipal || 'Votre Conseiller'}
+  Courtier Référent   : ${advisorName || lead.assignedBroker || cabinetInfo.nomCourtierPrincipal || 'Votre Conseiller'}
 
 SOUSCRIPTEUR PROSPECT :
   Civilité & Identité : ${civility} ${lead.prenom} ${lead.nom}
@@ -249,11 +258,13 @@ ${riskInfoText}
 --------------------------------------------------------------------------------
 4. PROPOSITION TARIFAIRE ET COTISATION
 --------------------------------------------------------------------------------
-Formule Souscrite    : ${formula}
-Option de Règlement  : ${fractionnement}
-Cotisation (${fractionnement}) : ${cotisation.toFixed(2)} € TTC
-Cotisation Annuelle Equivalent : ${cotisationAnnee.toFixed(2)} € TTC
-Frais de Dossier Courtage   : ${fraisDossier.toFixed(2)} € (Réglables à la souscription)
+Formule Souscrite         : ${formula}
+Option de Règlement       : ${fractionnement}
+${isMensuel 
+  ? `Cotisation Mensuelle       : ${cotisation.toFixed(2)} € TTC / mois`
+  : `Cotisation (${fractionnement})  : ${cotisation.toFixed(2)} € TTC\nCotisation Annuelle Equivalent : ${cotisationAnnee.toFixed(2)} € TTC`
+}
+Frais de Dossier Courtage : ${fraisDossier.toFixed(2)} € (Réglables à la souscription)
 --------------------------------------------------------------------------------
 PREMIER RÈGLEMENT À LA SOUSCRIPTION : ${(cotisation + fraisDossier).toFixed(2)} € TTC
 --------------------------------------------------------------------------------
@@ -322,7 +333,7 @@ Le présent devis d'assurance est établi sur la base exacte des déclarations f
 --------------------------------------------------------------------------------
 CADRE DE SOUSCRIPTION - BON POUR ACCORD
 --------------------------------------------------------------------------------
-Je soussigné(e) ${civility} ${lead.prenom} ${lead.nom}, confirme l'exactitude des informations ci-dessus, reconnaît avoir reçu la fiche de devoir de conseil ainsi que les conditions générales, et accepte la proposition d'assurance N° ${lead.referenceDevis} au tarif de ${cotisation.toFixed(2)} € / ${fractionnement.toLowerCase()}.
+Je soussigné(e) ${civility} ${lead.prenom} ${lead.nom}, confirme l'exactitude des informations ci-dessus, reconnaît avoir reçu la fiche de devoir de conseil ainsi que les conditions générales, et accepte la proposition d'assurance N° ${lead.referenceDevis} au tarif de ${cotisation.toFixed(2)} € / ${isMensuel ? 'mois' : fractionnement.toLowerCase()}.
 
 Fait à : .............................., Le : ....................
 

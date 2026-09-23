@@ -30,11 +30,22 @@ import {
   ExternalLink,
   FileUp,
   AlertCircle,
-  Download
+  Download,
+  FolderArchive,
+  Lock,
+  Server,
+  Check,
+  XCircle,
+  Building2
 } from 'lucide-react';
-import { Lead, LeadStatus, EmailTemplate, CabinetInfo, ActivityLogItem, NoteItem, LeadType, SmtpConfig, User as UserType, InsurancePartnerApiConfig, PartnerTarifResult } from '../types/crm';
+import { Lead, LeadStatus, EmailTemplate, CabinetInfo, ActivityLogItem, NoteItem, LeadType, SmtpConfig, User as UserType, InsurancePartnerApiConfig, getUserDisplayName, completeProchaineAction, cancelProchaineAction } from '../types/crm';
 import { generateProfessionalQuoteText, getGuaranteesList, getQuotePricing, getLeadCivility as civilityHelper } from '../utils/quoteGenerator';
-import { PartnerMultiTarificateur } from './PartnerMultiTarificateur';
+import { buildCompleteEmailText, generateProfessionalEmailFooterHtml } from '../utils/emailFooter';
+import { LeadDocumentsTab } from './LeadDocumentsTab';
+import { TelephonyModal } from './TelephonyModal';
+import { DdaSignatureModal } from './DdaSignatureModal';
+import { DevoirConseilModal } from './DevoirConseilModal';
+import { isLeadAccessibleByUser, canUserDeleteLead } from '../utils/permissions';
 
 interface EmailAttachmentItem {
   id: string;
@@ -116,17 +127,18 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
 
   const handleReassignAgent = (newAgentName: string) => {
     if (!newAgentName || !lead || !onUpdateLead) return;
-    const matchedUser = users?.find(u => `${u.prenom} ${u.nom}` === newAgentName);
+    const matchedUser = users?.find(u => getUserDisplayName(u) === newAgentName || `${u.prenom} ${u.nom}` === newAgentName || u.pseudo === newAgentName);
     const newEquipe = matchedUser?.equipe || lead.equipe || currentUser?.equipe || '';
 
     const timestamp = new Date().toLocaleDateString('fr-FR') + ' à ' + new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+    const actingUserName = currentUser ? getUserDisplayName(currentUser) : 'Système';
 
     const newActivity: ActivityLogItem = {
       id: 'act-reassign-' + Date.now(),
       type: 'LEAD_UPDATED',
       title: `Réattribution du lead`,
-      description: `Lead réattribué à ${newAgentName}${newEquipe ? ` (Équipe : ${newEquipe})` : ''} par ${currentUser?.prenom || ''} ${currentUser?.nom || 'Admin'}.`,
-      author: `${currentUser?.prenom || ''} ${currentUser?.nom || 'Système'}`.trim(),
+      description: `Lead réattribué à ${newAgentName}${newEquipe ? ` (Équipe : ${newEquipe})` : ''} par ${actingUserName}.`,
+      author: actingUserName,
       date: timestamp
     };
 
@@ -134,6 +146,7 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
       ...lead,
       assignedBroker: newAgentName,
       attribueA: newAgentName,
+      assignedTo: matchedUser?.id || lead.assignedTo,
       equipe: newEquipe,
       historyLogs: [newActivity, ...(lead.historyLogs || [])],
       updatedAt: new Date().toISOString()
@@ -142,10 +155,11 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
     onUpdateLead(updatedLead);
   };
 
-  const [activeDetailTab, setActiveDetailTab] = useState<'details' | 'history'>('details');
+  const [activeDetailTab, setActiveDetailTab] = useState<'details' | 'documents' | 'history' | 'dda_signature'>('details');
   const [showEmailModal, setShowEmailModal] = useState(false);
+  const [showTelephonyModal, setShowTelephonyModal] = useState(false);
   const [showDeleteLeadModal, setShowDeleteLeadModal] = useState(false);
-  const [showQuotePreview, setShowQuotePreview] = useState(false);
+  const [showDevoirConseilModal, setShowDevoirConseilModal] = useState(false);
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
     emailTemplates.find(t => t.type === lead.type)?.id || emailTemplates[0]?.id || ''
   );
@@ -155,6 +169,189 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
   const [customEmailBody, setCustomEmailBody] = useState<string>('');
   const [emailSuccessMsg, setEmailSuccessMsg] = useState(false);
   const [emailSendMethod, setEmailSendMethod] = useState<'MAILTO' | 'DIRECT'>('DIRECT');
+  const [selectedSmtpChoice, setSelectedSmtpChoice] = useState<'AUTO' | 'CABINET' | 'USER'>('AUTO');
+
+  // Compute effective SMTP config and resolution metadata
+  const { effectiveSmtpConfig, smtpSourceInfo, availableSmtpOptions } = React.useMemo(() => {
+    // 1. Check validity of Cabinet SMTP
+    const hasValidCabinetSmtp = Boolean(
+      smtpConfig?.host?.trim() &&
+      smtpConfig?.username?.trim()
+    );
+
+    // 2. Check validity of Dedicated User SMTP (must have host, username AND password)
+    const userSmtp = currentUser?.smtpConfig;
+    const hasValidUserSmtp = Boolean(
+      userSmtp?.active &&
+      userSmtp?.host?.trim() &&
+      userSmtp?.username?.trim() &&
+      userSmtp?.password?.trim() &&
+      !(userSmtp.host.trim() === 'smtp.gmail.com' && !userSmtp.password?.trim())
+    );
+
+    // Available options for UI switcher
+    const options = {
+      hasCabinet: hasValidCabinetSmtp,
+      hasUser: hasValidUserSmtp,
+      cabinetHost: smtpConfig?.host || '',
+      userHost: userSmtp?.host || ''
+    };
+
+    // User explicitly chose Cabinet SMTP
+    if (selectedSmtpChoice === 'CABINET' && hasValidCabinetSmtp) {
+      return {
+        effectiveSmtpConfig: {
+          ...smtpConfig,
+          active: true,
+          senderName: smtpConfig.senderName || cabinetInfo.nomCabinet || cabinetInfo.nomCourtierPrincipal
+        },
+        smtpSourceInfo: {
+          label: 'SMTP Principal Cabinet',
+          sourceName: cabinetInfo.nomCabinet || 'Cabinet',
+          type: 'CABINET' as const
+        },
+        availableSmtpOptions: options
+      };
+    }
+
+    // User explicitly chose Dedicated User SMTP
+    if (selectedSmtpChoice === 'USER' && hasValidUserSmtp && userSmtp) {
+      return {
+        effectiveSmtpConfig: {
+          ...userSmtp,
+          senderName: userSmtp.senderName || getUserDisplayName(currentUser),
+          senderEmail: userSmtp.senderEmail || currentUser?.email
+        },
+        smtpSourceInfo: {
+          label: 'SMTP Dédié Utilisateur',
+          sourceName: getUserDisplayName(currentUser),
+          type: 'USER' as const
+        },
+        availableSmtpOptions: options
+      };
+    }
+
+    // AUTO RESOLUTION:
+    // Rule A: If current user is ADMIN, ALWAYS prioritize the Cabinet SMTP configured in Settings
+    if (currentUser?.role === 'ADMIN' && hasValidCabinetSmtp) {
+      return {
+        effectiveSmtpConfig: {
+          ...smtpConfig,
+          active: true,
+          senderName: smtpConfig.senderName || cabinetInfo.nomCabinet || cabinetInfo.nomCourtierPrincipal
+        },
+        smtpSourceInfo: {
+          label: 'SMTP Principal Cabinet',
+          sourceName: cabinetInfo.nomCabinet || 'Cabinet',
+          type: 'CABINET' as const
+        },
+        availableSmtpOptions: options
+      };
+    }
+
+    // Rule B: Current user dedicated SMTP (if valid, authenticated with password)
+    if (hasValidUserSmtp && userSmtp) {
+      return {
+        effectiveSmtpConfig: {
+          ...userSmtp,
+          senderName: userSmtp.senderName || getUserDisplayName(currentUser),
+          senderEmail: userSmtp.senderEmail || currentUser?.email
+        },
+        smtpSourceInfo: {
+          label: 'SMTP Dédié Utilisateur',
+          sourceName: getUserDisplayName(currentUser),
+          type: 'USER' as const
+        },
+        availableSmtpOptions: options
+      };
+    }
+
+    // Rule C: Global Cabinet SMTP
+    if (hasValidCabinetSmtp) {
+      return {
+        effectiveSmtpConfig: {
+          ...smtpConfig,
+          active: true,
+          senderName: (currentUser ? getUserDisplayName(currentUser) : '') || smtpConfig.senderName || cabinetInfo.nomCourtierPrincipal
+        },
+        smtpSourceInfo: {
+          label: 'SMTP Principal Cabinet',
+          sourceName: cabinetInfo.nomCourtierPrincipal || 'Cabinet',
+          type: 'CABINET' as const
+        },
+        availableSmtpOptions: options
+      };
+    }
+
+    // Rule D: Fallback to assigned broker's SMTP if valid
+    const assignedUser = users.find(u => u.id === lead.assignedTo || `${u.prenom} ${u.nom}` === lead.assignedBroker || u.pseudo === lead.assignedBroker || getUserDisplayName(u) === lead.assignedBroker);
+    if (assignedUser?.smtpConfig?.active && assignedUser.smtpConfig?.host?.trim() && assignedUser.smtpConfig?.password?.trim()) {
+      return {
+        effectiveSmtpConfig: {
+          ...assignedUser.smtpConfig,
+          senderName: assignedUser.smtpConfig.senderName || getUserDisplayName(assignedUser),
+          senderEmail: assignedUser.smtpConfig.senderEmail || assignedUser.email
+        },
+        smtpSourceInfo: {
+          label: `SMTP Agent Assigné (${getUserDisplayName(assignedUser)})`,
+          sourceName: getUserDisplayName(assignedUser),
+          type: 'ASSIGNED' as const
+        },
+        availableSmtpOptions: options
+      };
+    }
+
+    // Rule E: Default fallback
+    const fallbackConfig = (smtpConfig?.host ? smtpConfig : (currentUser?.smtpConfig?.host ? currentUser.smtpConfig : smtpConfig)) || smtpConfig;
+    return {
+      effectiveSmtpConfig: {
+        ...fallbackConfig,
+        senderName: (currentUser ? getUserDisplayName(currentUser) : '') || fallbackConfig.senderName || cabinetInfo.nomCourtierPrincipal
+      },
+      smtpSourceInfo: {
+        label: 'SMTP Non Configuré',
+        sourceName: 'Aucun serveur configuré',
+        type: 'NONE' as const
+      },
+      availableSmtpOptions: options
+    };
+  }, [selectedSmtpChoice, currentUser, lead.assignedTo, lead.assignedBroker, users, smtpConfig, cabinetInfo]);
+
+  // Determine user display identifier (pseudo prioritized for signatures and logs)
+  const senderDisplayName = React.useMemo(() => {
+    if (currentUser) return getUserDisplayName(currentUser);
+    const assignedUser = users.find(u => u.id === lead.assignedTo || `${u.prenom} ${u.nom}` === lead.assignedBroker || u.pseudo === lead.assignedBroker || getUserDisplayName(u) === lead.assignedBroker);
+    if (assignedUser) return getUserDisplayName(assignedUser);
+    return lead.assignedBroker || cabinetInfo.nomCourtierPrincipal || 'Votre Conseiller Dédié';
+  }, [currentUser, users, lead.assignedTo, lead.assignedBroker, cabinetInfo]);
+
+  // Format the assigned agent display name (pseudo prioritized)
+  const assignedAgentDisplayName = React.useMemo(() => {
+    const raw = (lead.attribueA || lead.assignedBroker || '').trim();
+    if (!raw) return 'Non attribué';
+    if (currentUser) {
+      if (
+        (currentUser.pseudo && raw.toLowerCase() === currentUser.pseudo.toLowerCase()) ||
+        (`${currentUser.prenom} ${currentUser.nom}`.toLowerCase() === raw.toLowerCase()) ||
+        (currentUser.id === lead.assignedTo)
+      ) {
+        return getUserDisplayName(currentUser);
+      }
+    }
+    const matched = users?.find(
+      u => (u.pseudo && u.pseudo.toLowerCase() === raw.toLowerCase()) ||
+           (`${u.prenom} ${u.nom}`.toLowerCase() === raw.toLowerCase()) ||
+           getUserDisplayName(u).toLowerCase() === raw.toLowerCase() ||
+           u.id === lead.assignedTo
+    );
+    if (matched) return getUserDisplayName(matched);
+    return raw;
+  }, [lead.attribueA, lead.assignedBroker, lead.assignedTo, currentUser, users]);
+
+  // Lead deletion authorization check based on currentUser permissions
+  const canDeleteLead = React.useMemo(() => {
+    return canUserDeleteLead(currentUser);
+  }, [currentUser]);
 
   // Direct SMTP status state
   const [isSendingEmail, setIsSendingEmail] = useState(false);
@@ -163,7 +360,7 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
   // Pièces jointes (Attachments) state
   const [attachments, setAttachments] = useState<EmailAttachmentItem[]>([]);
   const [attachmentFiles, setAttachmentFiles] = useState<File[]>([]);
-  const [includePdfQuote, setIncludePdfQuote] = useState(false);
+  const [showEmailFooterPreview, setShowEmailFooterPreview] = useState(false);
 
   // Inline Template Creator state
   const [showNewTemplateForm, setShowNewTemplateForm] = useState(false);
@@ -179,6 +376,46 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
   const [quickActionHeure, setQuickActionHeure] = useState(lead.prochaineActionHeure || '15:00');
   const [noteSavedMsg, setNoteSavedMsg] = useState(false);
 
+  // Statuses list from cabinetInfo or default
+  const statusesOptions = React.useMemo(() => {
+    const list = cabinetInfo?.customStatuses && cabinetInfo.customStatuses.length > 0
+      ? [...cabinetInfo.customStatuses]
+      : [
+          { id: 'NOUVEAU', label: 'Nouveau Lead' },
+          { id: 'A_CONTACTER', label: 'À Contacter' },
+          { id: 'DEVIS_ENVOYE', label: 'Devis Envoyé' },
+          { id: 'RELANCE', label: 'Relance à faire' },
+          { id: 'PDG', label: 'PDG (Prise De Garantie)' },
+          { id: 'GAGNE', label: 'Souscrit / Gagné' },
+          { id: 'PERDU', label: 'Perdu / Rejeté' }
+        ];
+
+    if (!list.some((s) => s.id === 'PDG')) {
+      const gagneIdx = list.findIndex((s) => s.id === 'GAGNE');
+      if (gagneIdx !== -1) {
+        list.splice(gagneIdx, 0, { id: 'PDG', label: 'PDG (Prise De Garantie)' });
+      } else {
+        list.push({ id: 'PDG', label: 'PDG (Prise De Garantie)' });
+      }
+    }
+    return list;
+  }, [cabinetInfo?.customStatuses]);
+
+  const getStatusLabel = (status: LeadStatus) => {
+    const custom = statusesOptions.find(s => s.id === status);
+    if (custom) return custom.label;
+    switch (status) {
+      case 'NOUVEAU': return 'Nouveau Lead';
+      case 'A_CONTACTER': return 'À Contacter';
+      case 'DEVIS_ENVOYE': return 'Devis Envoyé';
+      case 'RELANCE': return 'Relance à faire';
+      case 'PDG': return 'PDG (Prise De Garantie)';
+      case 'GAGNE': return 'Souscrit / Gagné';
+      case 'PERDU': return 'Perdu / Rejeté';
+      default: return status.replace('_', ' ');
+    }
+  };
+
   // Helper for status badge styling
   const getStatusBadge = (status: LeadStatus) => {
     switch (status) {
@@ -190,43 +427,83 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
         return 'bg-purple-100 text-purple-800 border-purple-200';
       case 'RELANCE':
         return 'bg-orange-100 text-orange-800 border-orange-200';
+      case 'PDG':
+        return 'bg-indigo-100 text-indigo-900 border-indigo-300 font-bold';
       case 'GAGNE':
         return 'bg-emerald-100 text-emerald-800 border-emerald-200';
       case 'PERDU':
         return 'bg-rose-100 text-rose-800 border-rose-200';
       default:
-        return 'bg-slate-100 text-slate-800';
+        return 'bg-indigo-100 text-indigo-800 border-indigo-200';
     }
   };
 
   // Helper to get formula and cotisation
   let formulaName = 'Non définie';
-  let cotisationAn = 0;
+  let rawCotisation = 0;
   let fractionnement = 'Mensuel';
   let fraisDossier = 0;
   let optionsList: string[] = [];
 
   if (lead.type === 'AUTO' && lead.autoDetails) {
-    formulaName = lead.autoDetails.formuleSouhaitee;
-    cotisationAn = lead.autoDetails.cotisationMontant;
-    fractionnement = lead.autoDetails.fractionnement;
-    fraisDossier = lead.autoDetails.fraisDossier;
-    optionsList = lead.autoDetails.optionsSupplementaires;
+    formulaName = lead.autoDetails.formuleSouhaitee || 'Non définie';
+    rawCotisation = lead.autoDetails.cotisationMontant || 0;
+    fractionnement = lead.autoDetails.fractionnement || 'Mensuel';
+    fraisDossier = lead.autoDetails.fraisDossier || 0;
+    optionsList = lead.autoDetails.optionsSupplementaires || [];
   } else if (lead.type === 'HABITATION' && lead.habitationDetails) {
-    formulaName = lead.habitationDetails.formuleSouhaitee;
-    cotisationAn = lead.habitationDetails.cotisationMontant;
-    fractionnement = lead.habitationDetails.fractionnement;
-    fraisDossier = lead.habitationDetails.fraisDossier;
-    optionsList = lead.habitationDetails.optionsSupplementaires;
+    formulaName = lead.habitationDetails.formuleSouhaitee || 'Non définie';
+    rawCotisation = lead.habitationDetails.cotisationMontant || 0;
+    fractionnement = lead.habitationDetails.fractionnement || 'Mensuel';
+    fraisDossier = lead.habitationDetails.fraisDossier || 0;
+    optionsList = lead.habitationDetails.optionsSupplementaires || [];
   } else if (lead.type === 'VTC' && lead.vtcDetails) {
-    formulaName = lead.vtcDetails.formuleSouhaitee;
-    cotisationAn = lead.vtcDetails.cotisationMontant;
-    fractionnement = lead.vtcDetails.fractionnement;
-    fraisDossier = lead.vtcDetails.fraisDossier;
-    optionsList = lead.vtcDetails.optionsSupplementaires;
+    formulaName = lead.vtcDetails.formuleSouhaitee || 'Non définie';
+    rawCotisation = lead.vtcDetails.cotisationMontant || 0;
+    fractionnement = lead.vtcDetails.fractionnement || 'Mensuel';
+    fraisDossier = lead.vtcDetails.fraisDossier || 0;
+    optionsList = lead.vtcDetails.optionsSupplementaires || [];
   }
 
-  const cotisationMois = Math.round(cotisationAn / 12);
+  const isMensuel = fractionnement.toLowerCase().includes('mensuel');
+  const isTrimestriel = fractionnement.toLowerCase().includes('trimestriel');
+  const isSemestriel = fractionnement.toLowerCase().includes('semestriel');
+  const isAnnuel = fractionnement.toLowerCase().includes('annuel');
+
+  // Calcul du montant affiché selon le fractionnement choisi
+  let cotisationAffichee = rawCotisation;
+  let cotisationTitre = 'Cotisation Mensuelle';
+  let cotisationSousTitre = 'par mois TTC';
+
+  if (isMensuel) {
+    cotisationTitre = 'Cotisation Mensuelle';
+    cotisationSousTitre = 'par mois TTC';
+    // Si la valeur stockée était une ancienne valeur annuelle (> 300 pour auto/hab/vtc mensuel)
+    if (rawCotisation > 300) {
+      cotisationAffichee = Math.round((rawCotisation / 12) * 100) / 100;
+    } else {
+      cotisationAffichee = rawCotisation;
+    }
+  } else if (isTrimestriel) {
+    cotisationTitre = 'Cotisation Trimestrielle';
+    cotisationSousTitre = 'par trimestre TTC';
+    cotisationAffichee = rawCotisation;
+  } else if (isSemestriel) {
+    cotisationTitre = 'Cotisation Semestrielle';
+    cotisationSousTitre = 'par semestre TTC';
+    cotisationAffichee = rawCotisation;
+  } else {
+    cotisationTitre = 'Cotisation Annuelle';
+    cotisationSousTitre = 'par an TTC';
+    cotisationAffichee = rawCotisation;
+  }
+
+  const cotisationMois = isMensuel
+    ? cotisationAffichee
+    : Math.round((cotisationAffichee / 12) * 100) / 100;
+  const cotisationAn = isMensuel
+    ? Math.round(cotisationAffichee * 12 * 100) / 100
+    : cotisationAffichee;
 
   const getLeadCivility = (targetLead?: Lead): string => {
     const l = targetLead || lead;
@@ -274,17 +551,51 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
     subject = subject.replace(/{nomCabinet}/g, cabinetInfo.nomCabinet);
 
     let body = tmpl.body;
+
+    const formattedCotis = cotisationAffichee.toLocaleString('fr-FR', {
+      minimumFractionDigits: cotisationAffichee % 1 === 0 ? 0 : 2,
+      maximumFractionDigits: 2
+    });
+
+    if (isMensuel) {
+      // Pour un lead en fractionnement mensuel, remplacer rigoureusement toute mention annuelle par le mensuel
+      body = body.replace(/Cotisation annuelle\s*:\s*{cotisation}\s*€/gi, `Cotisation : ${formattedCotis} € / mois`);
+      body = body.replace(/Cotisation\s*:\s*{cotisation}\s*€\s*\/\s*an\s*\(\s*{cotisationMois}\s*€\s*\/\s*mois\s*\)/gi, `Cotisation : ${formattedCotis} € / mois`);
+      body = body.replace(/{cotisation}\s*€\s*\/\s*an\s*\(\s*{cotisationMois}\s*€\s*\/\s*mois\s*\)/gi, `${formattedCotis} € / mois`);
+      body = body.replace(/Cotisation\s*:\s*{cotisation}\s*€\s*\/\s*an/gi, `Cotisation : ${formattedCotis} € / mois`);
+      body = body.replace(/Cotisation\s*:\s*{cotisation}\s*€\/an/gi, `Cotisation : ${formattedCotis} € / mois`);
+      body = body.replace(/{cotisation}\s*€\s*\/\s*an/gi, `${formattedCotis} € / mois`);
+      body = body.replace(/{cotisation}\s*€\/an/gi, `${formattedCotis} € / mois`);
+      body = body.replace(/{cotisationMois}/g, formattedCotis);
+      body = body.replace(/{cotisation}/g, formattedCotis);
+    } else if (isTrimestriel) {
+      body = body.replace(/Cotisation annuelle\s*:\s*{cotisation}\s*€/gi, `Cotisation : ${formattedCotis} € / trimestre`);
+      body = body.replace(/{cotisation}\s*€\s*\/\s*an/gi, `${formattedCotis} € / trimestre`);
+      body = body.replace(/{cotisation}/g, formattedCotis);
+      body = body.replace(/{cotisationMois}/g, Math.round(cotisationAffichee / 3).toString());
+    } else if (isSemestriel) {
+      body = body.replace(/Cotisation annuelle\s*:\s*{cotisation}\s*€/gi, `Cotisation : ${formattedCotis} € / semestre`);
+      body = body.replace(/{cotisation}\s*€\s*\/\s*an/gi, `${formattedCotis} € / semestre`);
+      body = body.replace(/{cotisation}/g, formattedCotis);
+      body = body.replace(/{cotisationMois}/g, Math.round(cotisationAffichee / 6).toString());
+    } else {
+      // Annuel
+      body = body.replace(/{cotisation}/g, formattedCotis);
+      body = body.replace(/{cotisationMois}/g, Math.round(cotisationAffichee / 12).toString());
+    }
+
     body = body.replace(/{civilite}/g, civilityStr);
     body = body.replace(/{prenom}/g, lead.prenom);
     body = body.replace(/{nom}/g, lead.nom);
     body = body.replace(/{referenceDevis}/g, lead.referenceDevis);
     body = body.replace(/{formule}/g, formulaName);
-    body = body.replace(/{cotisation}/g, cotisationAn.toString());
-    body = body.replace(/{cotisationMois}/g, cotisationMois.toString());
     body = body.replace(/{fractionnement}/g, fractionnement);
     body = body.replace(/{fraisDossier}/g, fraisDossier.toString());
     body = body.replace(/{telephoneCabinet}/g, cabinetInfo.telephone);
-    body = body.replace(/{nomCourtier}/g, lead.assignedBroker || cabinetInfo.nomCourtierPrincipal);
+    body = body.replace(/{nomCourtier}/g, senderDisplayName);
+    body = body.replace(/{pseudo}/g, senderDisplayName);
+    subject = subject.replace(/{nomCourtier}/g, senderDisplayName);
+    subject = subject.replace(/{pseudo}/g, senderDisplayName);
     body = body.replace(/{nomCabinet}/g, cabinetInfo.nomCabinet);
     body = body.replace(/{numeroOrias}/g, cabinetInfo.numeroOrias);
 
@@ -311,7 +622,6 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
     populateEmailContent(selectedTemplateId);
     setAttachments([]);
     setAttachmentFiles([]);
-    setIncludePdfQuote(false);
     setShowNewTemplateForm(false);
     setSmtpErrorMsg(null);
     setIsSendingEmail(false);
@@ -430,7 +740,7 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
   };
 
   const handleDownloadQuoteTxt = () => {
-    const txtContent = generateProfessionalQuoteText(lead, cabinetInfo);
+    const txtContent = generateProfessionalQuoteText(lead, cabinetInfo, senderDisplayName);
     const blob = new Blob([txtContent], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -461,9 +771,6 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
     const timestamp = new Date().toLocaleDateString('fr-FR') + ' à ' + new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
 
     const attachedNames: string[] = [];
-    if (includePdfQuote) {
-      attachedNames.push(`Devis_Officiel_${lead.referenceDevis}.pdf`);
-    }
     attachments.forEach(a => attachedNames.push(a.name));
 
     const attSummary = attachedNames.length > 0
@@ -507,7 +814,14 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
         onUpdateLead(updatedLead);
       }
 
-      const mailtoUrl = `mailto:${lead.email}?subject=${encodeURIComponent(customEmailSubject)}&body=${encodeURIComponent(customEmailBody)}`;
+      // Append professional cabinet footer to text body for mailto
+      const emailBodyWithFooter = buildCompleteEmailText(customEmailBody, cabinetInfo, {
+        advisorName: senderDisplayName,
+        advisorEmail: effectiveSmtpConfig.senderEmail || currentUser?.email,
+        advisorPhone: cabinetInfo.telephone
+      });
+
+      const mailtoUrl = `mailto:${lead.email}?subject=${encodeURIComponent(customEmailSubject)}&body=${encodeURIComponent(emailBodyWithFooter)}`;
       window.location.href = mailtoUrl;
 
       setEmailSendMethod('MAILTO');
@@ -522,8 +836,8 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
     }
 
     // DIRECT SMTP METHOD
-    if (!smtpConfig || !smtpConfig.host || !smtpConfig.username) {
-      setSmtpErrorMsg("⚠️ Votre serveur SMTP n'est pas configuré ! Veuillez renseigner le serveur SMTP, le port et le mot de passe dans les Paramètres du CRM.");
+    if (!effectiveSmtpConfig || !effectiveSmtpConfig.host || !effectiveSmtpConfig.username) {
+      setSmtpErrorMsg("⚠️ Aucun serveur SMTP n'est configuré pour l'envoi d'emails ! Veuillez configurer votre serveur SMTP dans la gestion des utilisateurs ou dans les Paramètres du cabinet.");
       return;
     }
 
@@ -532,18 +846,7 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
     try {
       const attachmentsToSend: { filename: string; content: string; contentType?: string }[] = [];
 
-      // 1. Include generated Quote PDF if checked
-      if (includePdfQuote) {
-        const quoteText = generateProfessionalQuoteText(lead, cabinetInfo);
-        const quoteBase64 = btoa(unescape(encodeURIComponent(quoteText)));
-        attachmentsToSend.push({
-          filename: `Devis_Officiel_${lead.referenceDevis}.pdf`,
-          content: quoteBase64,
-          contentType: 'application/pdf'
-        });
-      }
-
-      // 2. Include user uploaded files
+      // Include user uploaded files
       for (const file of attachmentFiles) {
         const b64 = await fileToBase64(file);
         attachmentsToSend.push({
@@ -559,10 +862,16 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          smtpConfig,
+          smtpConfig: effectiveSmtpConfig,
           to: lead.email,
           subject: customEmailSubject,
           body: customEmailBody,
+          cabinetInfo: cabinetInfo,
+          advisorName: senderDisplayName,
+          advisorEmail: effectiveSmtpConfig.senderEmail || currentUser?.email,
+          advisorPhone: cabinetInfo.telephone,
+          signatureImageUrl: cabinetInfo.emailSignatureImageUrl,
+          signatureMode: cabinetInfo.emailSignatureMode,
           attachments: attachmentsToSend
         })
       });
@@ -583,8 +892,8 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
         id: 'act-' + Date.now(),
         type: 'EMAIL_SENT',
         title: `Email direct SMTP envoyé : ${customEmailSubject}`,
-        description: `Envoyé via ${smtpConfig.host} à <${lead.email}>\n\n${customEmailBody}${attSummary}`,
-        author: cabinetInfo.nomCourtierPrincipal || 'Courtier',
+        description: `Envoyé via ${effectiveSmtpConfig.host} (${effectiveSmtpConfig.senderEmail || effectiveSmtpConfig.username}) à <${lead.email}>\n\n${customEmailBody}${attSummary}`,
+        author: senderDisplayName,
         date: timestamp,
         metadata: {
           emailSubject: customEmailSubject,
@@ -595,9 +904,9 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
 
       const newNote: NoteItem = {
         id: 'note-' + Date.now(),
-        author: cabinetInfo.nomCourtierPrincipal || 'Courtier',
+        author: senderDisplayName,
         date: timestamp,
-        content: `[Email SMTP Envoyé le ${timestamp}] Destinataire : ${lead.email} | Sujet : ${customEmailSubject}${attSummary}`
+        content: `[Email SMTP Envoyé le ${timestamp} par ${senderDisplayName}] Destinataire : ${lead.email} | Sujet : ${customEmailSubject}${attSummary}`
       };
 
       const updatedLead: Lead = {
@@ -674,6 +983,7 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
       prochaineActionIntitule: quickActionTitle,
       prochaineActionDate: quickActionDate,
       prochaineActionHeure: quickActionHeure,
+      prochaineActionStatut: 'A_FAIRE',
       historyLogs: [...newActivities, ...(lead.historyLogs || [])],
       updatedAt: new Date().toISOString()
     };
@@ -684,7 +994,27 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
 
     setQuickNoteText('');
     setNoteSavedMsg(true);
-    setTimeout(() => setNoteSavedMsg(false), 2000);
+    setTimeout(() => setNoteSavedMsg(false), 2500);
+  };
+
+  // Cocher que l'action est faite
+  const handleMarkActionDone = () => {
+    if (!lead || !onUpdateLead) return;
+    const author = currentUser ? getUserDisplayName(currentUser) : 'Conseiller';
+    const updated = completeProchaineAction(lead, author);
+    onUpdateLead(updated);
+    setNoteSavedMsg(true);
+    setTimeout(() => setNoteSavedMsg(false), 2500);
+  };
+
+  // Annuler l'action à faire
+  const handleCancelAction = () => {
+    if (!lead || !onUpdateLead) return;
+    const author = currentUser ? getUserDisplayName(currentUser) : 'Conseiller';
+    const updated = cancelProchaineAction(lead, author);
+    onUpdateLead(updated);
+    setNoteSavedMsg(true);
+    setTimeout(() => setNoteSavedMsg(false), 2500);
   };
 
   // Compile history logs including initial creation if empty
@@ -701,59 +1031,35 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
         }
       ];
 
-  const handleApplyPartnerQuote = (quoteResult: PartnerTarifResult) => {
-    if (!onUpdateLead) return;
-
-    let updatedLead: Lead = { ...lead };
-
-    if (lead.type === 'AUTO' && lead.autoDetails) {
-      updatedLead = {
-        ...lead,
-        autoDetails: {
-          ...lead.autoDetails,
-          formuleSouhaitee: quoteResult.formuleName,
-          cotisationMontant: quoteResult.cotisationAnnuelle,
-          fraisDossier: quoteResult.fraisDossier
-        }
-      };
-    } else if (lead.type === 'HABITATION' && lead.habitationDetails) {
-      updatedLead = {
-        ...lead,
-        habitationDetails: {
-          ...lead.habitationDetails,
-          formuleSouhaitee: quoteResult.formuleName,
-          cotisationMontant: quoteResult.cotisationAnnuelle,
-          fraisDossier: quoteResult.fraisDossier
-        }
-      };
-    } else if (lead.type === 'VTC' && lead.vtcDetails) {
-      updatedLead = {
-        ...lead,
-        vtcDetails: {
-          ...lead.vtcDetails,
-          formuleSouhaitee: quoteResult.formuleName,
-          cotisationMontant: quoteResult.cotisationAnnuelle,
-          fraisDossier: quoteResult.fraisDossier
-        }
-      };
-    }
-
-    const newActivity: ActivityLogItem = {
-      id: 'act-partner-quote-' + Date.now(),
-      type: 'STATUS_CHANGED',
-      title: `Tarif Partenaire retenu : ${quoteResult.partnerName}`,
-      description: `Offre ${quoteResult.formuleName} appliquée à ${quoteResult.cotisationMensuelle}€/mois (${quoteResult.cotisationAnnuelle}€/an). Réf Partenaire : ${quoteResult.quoteRefPartenaire}`,
-      author: cabinetInfo.nomCourtierPrincipal || 'Courtier',
-      date: new Date().toLocaleDateString('fr-FR') + ' à ' + new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
-    };
-
-    updatedLead.historyLogs = [newActivity, ...(updatedLead.historyLogs || [])];
-    onUpdateLead(updatedLead);
-  };
+  // Sécurité renforcée : interdire l'affichage si le compte connecté n'est pas autorisé
+  if (lead && currentUser && !isLeadAccessibleByUser(lead, currentUser)) {
+    return (
+      <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-4">
+        <div className="bg-white max-w-md w-full rounded-2xl shadow-2xl border border-rose-200 p-6 text-center space-y-4 animate-in fade-in">
+          <div className="w-14 h-14 bg-rose-100 text-rose-600 rounded-2xl mx-auto flex items-center justify-center shadow-inner">
+            <Lock className="w-7 h-7" />
+          </div>
+          <h3 className="text-base font-bold text-slate-900">Accès Dossier Non Autorisé</h3>
+          <p className="text-xs text-slate-600 leading-relaxed">
+            Ce dossier ({lead.prenom} {lead.nom}) est attribué à{' '}
+            <strong className="text-slate-900">{assignedAgentDisplayName}</strong>.
+            Votre profil <strong>{currentUser.role === 'AGENT_COMMERCIAL' ? 'Agent Commercial' : currentUser.role}</strong> ne vous autorise à consulter que les fiches et rappels qui vous sont directement assignés.
+          </p>
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-full py-2.5 px-4 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl shadow-sm transition cursor-pointer"
+          >
+            Fermer le dossier
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
-      <div className="bg-white w-full max-w-4xl rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[94vh] my-auto">
+      <div className="bg-white w-full max-w-6xl 2xl:max-w-7xl rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[94vh] my-auto">
         
         {/* Top Sticky Bar */}
         <div className="bg-slate-900 text-white p-5 flex flex-wrap items-center justify-between gap-4 border-b border-slate-800">
@@ -779,13 +1085,29 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
               </div>
               <p className="text-xs text-slate-300 flex items-center gap-2 mt-0.5">
                 <span>{lead.ville} ({lead.codePostal})</span>
-                <span>•</span>
-                <span>Qualif: 🔥 {lead.qualification}</span>
               </p>
             </div>
           </div>
 
           <div className="flex items-center space-x-2">
+            <button
+              onClick={() => setShowDevoirConseilModal(true)}
+              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg shadow-md flex items-center gap-1.5 transition cursor-pointer"
+              title="Générer ou imprimer le Devoir de Conseil officiel (DDA 2026)"
+            >
+              <FileText className="w-3.5 h-3.5" />
+              <span>Devoir de Conseil</span>
+            </button>
+
+            <button
+              onClick={() => setShowTelephonyModal(true)}
+              className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg shadow-md flex items-center gap-1.5 transition cursor-pointer"
+              title="Lancer un appel téléphonique (Click-to-Call)"
+            >
+              <Phone className="w-3.5 h-3.5" />
+              <span>Appeler</span>
+            </button>
+
             <button
               onClick={() => onEditLead(lead)}
               className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold rounded-lg border border-slate-700 transition flex items-center gap-1.5"
@@ -803,14 +1125,6 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
             </button>
 
             <button
-              onClick={() => setShowQuotePreview(true)}
-              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold rounded-lg border border-slate-700 transition flex items-center gap-1.5"
-            >
-              <Printer className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Imprimer Devis</span>
-            </button>
-
-            <button
               onClick={onClose}
               className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition"
             >
@@ -824,23 +1138,24 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
           <div className="flex items-center space-x-2">
             <span className="font-bold text-slate-600 uppercase text-[10px] tracking-wider">Statut Actuel :</span>
             <span className={`px-2.5 py-0.5 rounded-full font-bold border ${getStatusBadge(lead.status)}`}>
-              {lead.status.replace('_', ' ')}
+              {getStatusLabel(lead.status)}
             </span>
           </div>
 
-          <div className="flex items-center space-x-1">
+          <div className="flex items-center space-x-1 flex-wrap gap-y-1">
             <span className="font-bold text-slate-600 text-[10px] uppercase mr-1">Changer Statut :</span>
-            {(['NOUVEAU', 'A_CONTACTER', 'DEVIS_ENVOYE', 'RELANCE', 'GAGNE', 'PERDU'] as LeadStatus[]).map((st) => (
+            {statusesOptions.map((st) => (
               <button
-                key={st}
-                onClick={() => onUpdateStatus(lead.id, st)}
-                className={`px-2 py-1 rounded text-[10px] font-bold transition ${
-                  lead.status === st
+                key={st.id}
+                onClick={() => onUpdateStatus(lead.id, st.id)}
+                className={`px-2 py-1 rounded text-[10px] font-bold transition cursor-pointer ${
+                  lead.status === st.id
                     ? 'bg-slate-900 text-white shadow'
                     : 'bg-white hover:bg-slate-200 text-slate-700 border border-slate-200'
                 }`}
+                title={st.label}
               >
-                {st.substring(0, 7)}
+                {st.label.length > 14 ? `${st.label.substring(0, 12)}...` : st.label}
               </button>
             ))}
           </div>
@@ -854,7 +1169,7 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
               <span>Agent Attribué :</span>
             </div>
             <span className="font-extrabold text-white text-sm">
-              {lead.attribueA || lead.assignedBroker || 'Non attribué'}
+              {assignedAgentDisplayName}
             </span>
             {lead.equipe && (
               <span className="text-[11px] font-semibold text-indigo-200 bg-indigo-800/50 px-2 py-0.5 rounded border border-indigo-700/40">
@@ -875,8 +1190,8 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
               >
                 <option value="">-- Sélectionner Agent --</option>
                 {selectableUsers.map((u) => (
-                  <option key={u.id} value={`${u.prenom} ${u.nom}`}>
-                    {u.prenom} {u.nom} ({u.role === 'AGENT_COMMERCIAL' ? 'Agent' : u.role === 'RESPONSABLE_EQUIPE' ? 'Resp. Équipe' : u.role}) {u.equipe ? `— ${u.equipe}` : ''}
+                  <option key={u.id} value={getUserDisplayName(u)}>
+                    {getUserDisplayName(u)} ({u.role === 'AGENT_COMMERCIAL' ? 'Agent' : u.role === 'RESPONSABLE_EQUIPE' ? 'Resp. Équipe' : u.role}) {u.equipe ? `— ${u.equipe}` : ''}
                   </option>
                 ))}
               </select>
@@ -884,36 +1199,192 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
           )}
         </div>
 
-        {/* Content Details */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+        {/* Navigation Tabs (Dossier & Devis / Documents / Historique) */}
+        <div className="bg-slate-100/90 border-b border-slate-200 px-6 pt-2.5 flex space-x-2 overflow-x-auto shrink-0">
+          <button
+            type="button"
+            onClick={() => setActiveDetailTab('details')}
+            className={`px-4 py-2 text-xs font-bold rounded-t-xl transition border-b-2 whitespace-nowrap flex items-center gap-2 ${
+              activeDetailTab === 'details'
+                ? 'bg-white text-blue-700 border-blue-600 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 border-transparent hover:bg-slate-200/60'
+            }`}
+          >
+            <FileCheck className="w-4 h-4" />
+            <span>Dossier & Devis</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveDetailTab('documents')}
+            className={`px-4 py-2 text-xs font-bold rounded-t-xl transition border-b-2 whitespace-nowrap flex items-center gap-2 ${
+              activeDetailTab === 'documents'
+                ? 'bg-white text-blue-700 border-blue-600 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 border-transparent hover:bg-slate-200/60'
+            }`}
+          >
+            <FolderArchive className="w-4 h-4 text-amber-600" />
+            <span>Documents du dossier</span>
+            <span className={`px-2 py-0.5 rounded-full text-[10px] font-extrabold ${
+              (lead.documents?.length || 0) > 0 
+                ? 'bg-blue-100 text-blue-700' 
+                : 'bg-slate-200 text-slate-600'
+            }`}>
+              {lead.documents?.length || 0}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveDetailTab('history')}
+            className={`px-4 py-2 text-xs font-bold rounded-t-xl transition border-b-2 whitespace-nowrap flex items-center gap-2 ${
+              activeDetailTab === 'history'
+                ? 'bg-white text-blue-700 border-blue-600 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 border-transparent hover:bg-slate-200/60'
+            }`}
+          >
+            <History className="w-4 h-4 text-purple-600" />
+            <span>Historique & Échanges</span>
+            <span className="px-2 py-0.5 bg-slate-200 text-slate-600 rounded-full text-[10px] font-extrabold">
+              {historyList.length}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveDetailTab('dda_signature')}
+            className={`px-4 py-2 text-xs font-bold rounded-t-xl transition border-b-2 whitespace-nowrap flex items-center gap-2 ${
+              activeDetailTab === 'dda_signature'
+                ? 'bg-white text-blue-700 border-blue-600 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 border-transparent hover:bg-slate-200/60'
+            }`}
+          >
+            <ShieldCheck className="w-4 h-4 text-emerald-600" />
+            <span>Conformité DDA & Signature</span>
+            {lead.signatureData?.statut === 'SIGNE' ? (
+              <span className="px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full text-[10px] font-extrabold">
+                Signé ✓
+              </span>
+            ) : lead.ddaData?.statut === 'VALIDE' ? (
+              <span className="px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full text-[10px] font-extrabold">
+                DDA Validé
+              </span>
+            ) : null}
+          </button>
+        </div>
+
+        {/* TAB 1: DOSSIER & DEVIS */}
+        {activeDetailTab === 'details' && (
+          <div className="flex-1 overflow-y-auto p-6 space-y-6">
 
           {/* Key Proposition Summary Banner */}
-          <div className="p-5 bg-gradient-to-r from-blue-50 via-indigo-50 to-slate-50 border border-blue-200/80 rounded-2xl grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div>
-              <span className="text-[10px] font-bold uppercase tracking-wider text-blue-700">Formule Choisie</span>
-              <p className="text-base font-extrabold text-blue-950 mt-0.5">{formulaName}</p>
-              <span className="text-xs text-slate-500">{fractionnement}</span>
+          <div className="p-5 bg-gradient-to-r from-blue-50 via-indigo-50 to-slate-50 border border-blue-200/80 rounded-2xl space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-700">Formule Retenue</span>
+                <p className="text-base font-extrabold text-blue-950 mt-0.5">{formulaName}</p>
+                <span className="text-xs text-slate-500 font-medium">Fractionnement {fractionnement}</span>
+              </div>
+
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">{cotisationTitre}</span>
+                <p className="text-2xl font-black text-emerald-800 mt-0.5">
+                  {cotisationAffichee.toLocaleString('fr-FR', { minimumFractionDigits: cotisationAffichee % 1 === 0 ? 0 : 2, maximumFractionDigits: 2 })} €
+                </p>
+                <span className="text-xs font-semibold text-emerald-700">{cotisationSousTitre}</span>
+              </div>
+
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">Frais de Dossier</span>
+                <p className="text-lg font-bold text-slate-800 mt-0.5">{fraisDossier} € TTC</p>
+                <span className="text-xs text-slate-500">Inclus à la souscription</span>
+              </div>
             </div>
 
-            <div>
-              <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">Cotisation Annuelle</span>
-              <p className="text-2xl font-black text-emerald-800 mt-0.5">{cotisationAn.toLocaleString('fr-FR')} €</p>
-              <span className="text-xs font-semibold text-emerald-700">soit {cotisationMois} € / mois</span>
-            </div>
-
-            <div>
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600">Frais de Dossier</span>
-              <p className="text-lg font-bold text-slate-800 mt-0.5">{fraisDossier} € TTC</p>
-              <span className="text-xs text-slate-500">Inclus à la souscription</span>
-            </div>
+            {/* Comparatif 3 Formules si renseigné */}
+            {((lead.type === 'AUTO' && (lead.autoDetails?.cotisationTiersSimple || lead.autoDetails?.cotisationTiersEtendu || lead.autoDetails?.cotisationTousRisques)) ||
+              (lead.type === 'VTC' && (lead.vtcDetails?.cotisationTiersSimple || lead.vtcDetails?.cotisationTiersEtendu || lead.vtcDetails?.cotisationTousRisques)) ||
+              (lead.type === 'HABITATION' && (lead.habitationDetails?.cotisationFormuleEco || lead.habitationDetails?.cotisationFormuleConfort || lead.habitationDetails?.cotisationFormuleTousRisques))) && (
+              <div className="pt-3 border-t border-blue-200/60">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-700">
+                    Étude Comparative des 3 Formules ({fractionnement}) :
+                  </span>
+                  <span className="text-[10px] font-bold text-blue-700 bg-white px-2 py-0.5 rounded border border-blue-200">
+                    Devoir de conseil
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  {lead.type === 'AUTO' && (
+                    <>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Tiers Simple') ? 'bg-blue-100/70 border-blue-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">1. Tiers Simple</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.autoDetails?.cotisationTiersSimple ? `${lead.autoDetails.cotisationTiersSimple} €` : '—'}
+                        </div>
+                      </div>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Tiers Étendu') ? 'bg-blue-100/70 border-blue-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">2. Tiers Étendu</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.autoDetails?.cotisationTiersEtendu ? `${lead.autoDetails.cotisationTiersEtendu} €` : '—'}
+                        </div>
+                      </div>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Tous Risques') ? 'bg-blue-100/70 border-blue-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">3. Tous Risques</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.autoDetails?.cotisationTousRisques ? `${lead.autoDetails.cotisationTousRisques} €` : '—'}
+                        </div>
+                      </div>
+                    </>
+                  )}
+                  {lead.type === 'VTC' && (
+                    <>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Tiers VTC') ? 'bg-amber-100/80 border-amber-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">1. Tiers VTC + RC Pro</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.vtcDetails?.cotisationTiersSimple ? `${lead.vtcDetails.cotisationTiersSimple} €` : '—'}
+                        </div>
+                      </div>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Tiers Étendu') ? 'bg-amber-100/80 border-amber-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">2. Tiers Étendu VTC + RC Pro</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.vtcDetails?.cotisationTiersEtendu ? `${lead.vtcDetails.cotisationTiersEtendu} €` : '—'}
+                        </div>
+                      </div>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Tous Risques') ? 'bg-amber-100/80 border-amber-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">3. Tous Risques VTC + RC Pro</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.vtcDetails?.cotisationTousRisques ? `${lead.vtcDetails.cotisationTousRisques} €` : '—'}
+                        </div>
+                      </div>
+                    </>
+                  )}
+                  {lead.type === 'HABITATION' && (
+                    <>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Éco') ? 'bg-emerald-100/70 border-emerald-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">1. Formule Éco</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.habitationDetails?.cotisationFormuleEco ? `${lead.habitationDetails.cotisationFormuleEco} €` : '—'}
+                        </div>
+                      </div>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Confort') ? 'bg-emerald-100/70 border-emerald-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">2. Formule Confort</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.habitationDetails?.cotisationFormuleConfort ? `${lead.habitationDetails.cotisationFormuleConfort} €` : '—'}
+                        </div>
+                      </div>
+                      <div className={`p-2.5 rounded-xl border text-xs ${formulaName.includes('Tous Risques') ? 'bg-emerald-100/70 border-emerald-400 font-bold' : 'bg-white/80 border-slate-200'}`}>
+                        <div className="text-[10px] text-slate-500 font-semibold">3. Tous Risques</div>
+                        <div className="text-sm font-black text-slate-900 mt-0.5">
+                          {lead.habitationDetails?.cotisationFormuleTousRisques ? `${lead.habitationDetails.cotisationFormuleTousRisques} €` : '—'}
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
-
-          {/* Partner API Web Services Multi-Tarificateur Widget */}
-          <PartnerMultiTarificateur
-            lead={lead}
-            partners={partners}
-            onApplyQuoteToLead={handleApplyPartnerQuote}
-          />
 
           {/* Details Section by Product */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -969,6 +1440,42 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
                       <span className="text-slate-400">Modèle Véhicule:</span>
                       <p className="font-semibold text-slate-900">{lead.autoDetails.marqueModele || 'N/A'}</p>
                     </div>
+                    {lead.autoDetails.version && (
+                      <div>
+                        <span className="text-slate-400">Version / Finition:</span>
+                        <p className="font-medium text-slate-800">{lead.autoDetails.version}</p>
+                      </div>
+                    )}
+                    <div>
+                      <span className="text-slate-400">Énergie & Puissance:</span>
+                      <p className="text-slate-800 font-semibold">
+                        {lead.autoDetails.energie || 'Essence'} {lead.autoDetails.puissanceFiscale ? `• ${lead.autoDetails.puissanceFiscale} CV` : ''}
+                      </p>
+                    </div>
+                    {lead.autoDetails.valeurEstimee && (
+                      <div>
+                        <span className="text-slate-400">Valeur Achat/Estimée:</span>
+                        <p className="text-emerald-800 font-bold">{lead.autoDetails.valeurEstimee.toLocaleString('fr-FR')} €</p>
+                      </div>
+                    )}
+                    <div>
+                      <span className="text-slate-400">Kilométrage Annuel:</span>
+                      <p className={`font-bold ${lead.autoDetails.kilometrageAnnuel === 'Kilométrage illimité' ? 'text-indigo-700' : 'text-slate-800'}`}>
+                        {lead.autoDetails.kilometrageAnnuel === 'Kilométrage illimité' ? '⚡ Kilométrage illimité' : (lead.autoDetails.kilometrageAnnuel || '15 000–20 000')}
+                      </p>
+                    </div>
+                    {lead.autoDetails.stationnementNuit && (
+                      <div>
+                        <span className="text-slate-400">Stationnement Nuit:</span>
+                        <p className="text-slate-800 font-medium">{lead.autoDetails.stationnementNuit}</p>
+                      </div>
+                    )}
+                    {lead.autoDetails.statutVehicule && (
+                      <div>
+                        <span className="text-slate-400">Statut Acquisition:</span>
+                        <p className="text-slate-800 font-medium">{lead.autoDetails.statutVehicule}</p>
+                      </div>
+                    )}
                     <div>
                       <span className="text-slate-400">Propriétaire (Carte Grise):</span>
                       <p className="font-semibold text-slate-800">{lead.autoDetails.proprietaireVehicule || 'Conducteur principal'}</p>
@@ -1039,7 +1546,7 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
                 <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-3">
                   <h4 className="text-xs font-bold text-slate-900 uppercase tracking-wider border-b border-slate-200 pb-2 flex items-center gap-2">
                     <Briefcase className="w-4 h-4 text-amber-600" />
-                    Détails Activité VTC & Société
+                    Détails Activité VTC & Véhicule
                   </h4>
 
                   <div className="grid grid-cols-2 gap-2 text-xs">
@@ -1057,7 +1564,47 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
                     </div>
                     <div>
                       <span className="text-slate-400">Véhicule VTC:</span>
-                      <p className="text-slate-800">{lead.vtcDetails.marqueModele}</p>
+                      <p className="text-slate-800 font-semibold">{lead.vtcDetails.marqueModele}</p>
+                    </div>
+                    {lead.vtcDetails.version && (
+                      <div>
+                        <span className="text-slate-400">Version / Finition:</span>
+                        <p className="text-slate-800 font-medium">{lead.vtcDetails.version}</p>
+                      </div>
+                    )}
+                    <div>
+                      <span className="text-slate-400">Motorisation & Énergie:</span>
+                      <p className="text-slate-800 font-semibold">
+                        {lead.vtcDetails.typeMotorisation || 'Électrique'} {lead.vtcDetails.puissanceFiscale ? `• ${lead.vtcDetails.puissanceFiscale} CV` : ''}
+                      </p>
+                    </div>
+                    {lead.vtcDetails.valeurEstimee && (
+                      <div>
+                        <span className="text-slate-400">Valeur Vénale / Achat:</span>
+                        <p className="text-emerald-800 font-bold">{lead.vtcDetails.valeurEstimee.toLocaleString('fr-FR')} €</p>
+                      </div>
+                    )}
+                    <div>
+                      <span className="text-slate-400">Kilométrage Annuel:</span>
+                      <p className={`font-bold ${lead.vtcDetails.kilometrageAnnuel === 'Kilométrage illimité' ? 'text-amber-800' : 'text-slate-800'}`}>
+                        {lead.vtcDetails.kilometrageAnnuel === 'Kilométrage illimité' ? '⚡ Kilométrage illimité' : (lead.vtcDetails.kilometrageAnnuel || 'Kilométrage illimité')}
+                      </p>
+                    </div>
+                    {lead.vtcDetails.stationnementNuit && (
+                      <div>
+                        <span className="text-slate-400">Stationnement Nuit:</span>
+                        <p className="text-slate-800 font-medium">{lead.vtcDetails.stationnementNuit}</p>
+                      </div>
+                    )}
+                    {lead.vtcDetails.statutVehicule && (
+                      <div>
+                        <span className="text-slate-400">Statut Acquisition:</span>
+                        <p className="text-slate-800 font-medium">{lead.vtcDetails.statutVehicule}</p>
+                      </div>
+                    )}
+                    <div>
+                      <span className="text-slate-400">Propriétaire VTC:</span>
+                      <p className="font-semibold text-slate-800">{lead.vtcDetails.proprietaireVehicule || 'LOA'}</p>
                     </div>
                   </div>
                 </div>
@@ -1066,22 +1613,187 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
 
             {/* Right Box: Options, Prochaine Action & Notes Timeline */}
             <div className="space-y-4">
-              {/* Prochaine Action */}
-              <div className="p-4 bg-amber-50/70 border border-amber-200 rounded-xl space-y-2">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-amber-900 flex items-center gap-1.5">
-                  <Clock className="w-3.5 h-3.5 text-amber-600" />
-                  Rappel & Prochaine Action
-                </span>
+              {/* Prochaine Action & Relances Programmées */}
+              <div className="p-4 bg-amber-50/80 border border-amber-200 rounded-xl space-y-3 shadow-2xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-amber-900 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 text-amber-600" />
+                    Rappel Automatique & Relance Programmée
+                  </span>
+                  {noteSavedMsg && (
+                    <span className="text-[10px] font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded animate-pulse">
+                      ✓ Enregistré !
+                    </span>
+                  )}
+                </div>
 
-                <p className="text-xs font-bold text-slate-900">
-                  📌 {lead.prochaineActionIntitule || 'Pas d\'action définie'}
-                </p>
+                {lead.prochaineActionIntitule || lead.prochaineActionDate ? (
+                  <div className="bg-white p-3 rounded-xl border-2 border-amber-300 shadow-xs space-y-2.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="space-y-0.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="px-1.5 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 rounded text-[9px] font-black uppercase tracking-wider">
+                            À FAIRE
+                          </span>
+                          {lead.prochaineActionDate && lead.prochaineActionDate < new Date().toISOString().split('T')[0] && (
+                            <span className="px-1.5 py-0.5 bg-rose-100 text-rose-800 border border-rose-200 rounded text-[9px] font-black">
+                              EN RETARD
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs font-bold text-slate-900 flex items-center gap-1 mt-1">
+                          <span>📌</span>
+                          <span>{lead.prochaineActionIntitule || 'Rappel client'}</span>
+                        </p>
+                        {lead.prochaineActionDate && (
+                          <p className="text-[11px] font-mono text-amber-950 font-bold flex items-center gap-1">
+                            <Clock className="w-3 h-3 text-amber-600 shrink-0" />
+                            <span>{lead.prochaineActionDate} {lead.prochaineActionHeure && `à ${lead.prochaineActionHeure}`}</span>
+                          </p>
+                        )}
+                      </div>
+                    </div>
 
-                {lead.prochaineActionDate && (
-                  <p className="text-[11px] font-mono text-amber-800 font-semibold">
-                    📅 Date : {lead.prochaineActionDate} {lead.prochaineActionHeure && `à ${lead.prochaineActionHeure}`}
-                  </p>
+                    {/* Actions: Cocher fait ou Annuler */}
+                    <div className="pt-2 border-t border-slate-100 flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleMarkActionDone}
+                        className="flex-1 py-1.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold shadow-xs transition flex items-center justify-center gap-1.5 cursor-pointer"
+                        title="Cocher que cette action est faite"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                        <span>C'est fait</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleCancelAction}
+                        className="py-1.5 px-2.5 bg-white hover:bg-rose-50 text-rose-700 border border-rose-200 hover:border-rose-300 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer shadow-2xs"
+                        title="Annuler cette action"
+                      >
+                        <X className="w-3.5 h-3.5 text-rose-600" />
+                        <span>Annuler</span>
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {lead.derniereActionCloturee ? (
+                      <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-200 space-y-1">
+                        <div className="flex items-center gap-1.5 text-[11px] font-bold">
+                          {lead.derniereActionCloturee.statut === 'FAIT' ? (
+                            <>
+                              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                              <span className="text-emerald-800">Action précédente terminée</span>
+                            </>
+                          ) : (
+                            <>
+                              <XCircle className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                              <span className="text-slate-600">Action précédente annulée</span>
+                            </>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-slate-700 font-medium pl-5">
+                          « {lead.derniereActionCloturee.intitule} »
+                        </p>
+                        <p className="text-[10px] text-slate-400 pl-5">
+                          {lead.derniereActionCloturee.dateCloture} • {lead.derniereActionCloturee.auteur}
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="bg-white/80 p-2.5 rounded-lg border border-amber-200/60 text-center">
+                        <p className="text-[11px] text-slate-400 italic">Aucune action en attente.</p>
+                      </div>
+                    )}
+                  </div>
                 )}
+
+                {/* Quick Reschedule & Note Form */}
+                <div className="pt-2 border-t border-amber-200/60 space-y-2">
+                  <p className="text-[11px] font-bold text-slate-700">Programmer une relance rapide :</p>
+                  <div className="flex flex-wrap gap-1">
+                    {[
+                      { label: 'Devis envoyé', title: 'Relance devis envoyé' },
+                      { label: 'Relance docs', title: 'Relance pièces justificatives' },
+                      { label: 'Clôture contrat', title: 'Relance signature contrat' }
+                    ].map(sug => (
+                      <button
+                        key={sug.label}
+                        type="button"
+                        onClick={() => setQuickActionTitle(sug.title)}
+                        className={`text-[10px] font-semibold px-2 py-0.5 rounded border transition cursor-pointer ${
+                          quickActionTitle === sug.title ? 'bg-amber-600 text-white border-amber-600' : 'bg-white text-slate-700 border-amber-200 hover:bg-amber-100'
+                        }`}
+                      >
+                        {sug.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <input
+                    type="text"
+                    value={quickActionTitle}
+                    onChange={(e) => setQuickActionTitle(e.target.value)}
+                    placeholder="Intitulé de la relance..."
+                    className="w-full px-2.5 py-1.5 bg-white border border-amber-200 rounded-lg text-xs font-medium text-slate-800 outline-none focus:ring-1 focus:ring-amber-500"
+                  />
+
+                  <div className="flex items-center gap-1.5">
+                    {[
+                      { label: '+1j (Demain)', days: 1 },
+                      { label: '+2j', days: 2 },
+                      { label: '+3j', days: 3 },
+                      { label: '+7j', days: 7 }
+                    ].map(p => (
+                      <button
+                        key={p.label}
+                        type="button"
+                        onClick={() => {
+                          const d = new Date();
+                          d.setDate(d.getDate() + p.days);
+                          setQuickActionDate(d.toISOString().split('T')[0]);
+                        }}
+                        className="px-1.5 py-0.5 bg-white hover:bg-amber-100 text-amber-900 border border-amber-200 rounded text-[10px] font-bold transition cursor-pointer"
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <input
+                      type="date"
+                      value={quickActionDate}
+                      onChange={(e) => setQuickActionDate(e.target.value)}
+                      className="w-full px-2 py-1 bg-white border border-amber-200 rounded-lg text-xs font-medium outline-none"
+                    />
+                    <input
+                      type="time"
+                      value={quickActionHeure}
+                      onChange={(e) => setQuickActionHeure(e.target.value)}
+                      className="w-full px-2 py-1 bg-white border border-amber-200 rounded-lg text-xs font-medium outline-none"
+                    />
+                  </div>
+
+                  <input
+                    type="text"
+                    value={quickNoteText}
+                    onChange={(e) => setQuickNoteText(e.target.value)}
+                    placeholder="Ajouter une note de suivi (optionnel)..."
+                    className="w-full px-2.5 py-1.5 bg-white border border-amber-200 rounded-lg text-xs font-medium text-slate-800 outline-none focus:ring-1 focus:ring-amber-500"
+                  />
+
+                  <button
+                    type="button"
+                    onClick={handleAddQuickNoteAndRelance}
+                    disabled={!quickActionDate || !quickActionTitle.trim()}
+                    className="w-full py-1.5 bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-xs font-bold rounded-lg transition shadow-xs cursor-pointer flex items-center justify-center gap-1.5"
+                  >
+                    <Clock className="w-3.5 h-3.5" />
+                    <span>Valider & Programmer la relance</span>
+                  </button>
+                </div>
               </div>
 
               {/* Options incluses */}
@@ -1134,23 +1846,139 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
                   )}
                 </div>
               </div>
+
+              {/* Aperçu rapide Documents */}
+              <div className="p-4 bg-blue-50/50 rounded-xl border border-blue-200 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-bold text-slate-900 uppercase tracking-wider flex items-center gap-1.5">
+                    <FolderArchive className="w-3.5 h-3.5 text-blue-600" />
+                    Documents du Dossier ({lead.documents?.length || 0})
+                  </h4>
+                  <button
+                    type="button"
+                    onClick={() => setActiveDetailTab('documents')}
+                    className="text-[11px] font-bold text-blue-600 hover:text-blue-800 hover:underline cursor-pointer"
+                  >
+                    Gérer
+                  </button>
+                </div>
+
+                {(!lead.documents || lead.documents.length === 0) ? (
+                  <p className="text-xs text-slate-400 italic">Aucun document joint pour le moment.</p>
+                ) : (
+                  <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+                    {lead.documents.map((doc) => (
+                      <div
+                        key={doc.id}
+                        className="p-2 bg-white rounded-lg border border-slate-200 flex items-center justify-between text-xs gap-2"
+                      >
+                        <div className="truncate">
+                          <span className="font-bold text-slate-800 block truncate">{doc.name}</span>
+                          <span className="text-[10px] text-slate-400 font-mono">{doc.fileName}</span>
+                        </div>
+                        {doc.dataUrl && (
+                          <a
+                            href={doc.dataUrl}
+                            download={doc.fileName}
+                            className="p-1 text-blue-600 hover:text-blue-800 rounded transition shrink-0"
+                            title="Télécharger"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                          </a>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
+      )}
+
+      {/* TAB 2: DOCUMENTS DU DOSSIER */}
+      {activeDetailTab === 'documents' && (
+        <div className="flex-1 overflow-y-auto p-6">
+          <LeadDocumentsTab
+            documents={lead.documents || []}
+            onChangeDocuments={(newDocs) => onUpdateLead({ ...lead, documents: newDocs })}
+            leadType={lead.type}
+          />
+        </div>
+      )}
+
+      {/* TAB 3: HISTORIQUE ET ÉCHANGES */}
+      {activeDetailTab === 'history' && (
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-xs space-y-4">
+            <h4 className="text-sm font-bold text-slate-900 flex items-center gap-2 border-b border-slate-200 pb-3">
+              <History className="w-4 h-4 text-purple-600" />
+              Journal des Événements & Historique de Vie du Lead
+            </h4>
+
+            <div className="space-y-3">
+              {historyList.map((item) => (
+                <div key={item.id} className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl flex items-start gap-3 text-xs">
+                  <div className="p-2 bg-purple-100 text-purple-700 rounded-lg shrink-0 mt-0.5">
+                    <Clock className="w-4 h-4" />
+                  </div>
+                  <div className="flex-1 space-y-1">
+                    <div className="flex items-center justify-between flex-wrap gap-1">
+                      <span className="font-bold text-slate-900">{item.description}</span>
+                      <span className="text-[11px] text-slate-400 font-mono">
+                        {item.date ? new Date(item.date).toLocaleString('fr-FR') : ''}
+                      </span>
+                    </div>
+                    {item.author && (
+                      <p className="text-[11px] text-slate-500 font-medium">
+                        Par : <strong>{item.author}</strong>
+                      </p>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 4: CONFORMITÉ DDA & SIGNATURE ÉLECTRONIQUE */}
+      {activeDetailTab === 'dda_signature' && (
+        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+          <DdaSignatureModal
+            lead={lead}
+            cabinetInfo={cabinetInfo}
+            currentUser={currentUser}
+            smtpConfig={effectiveSmtpConfig}
+            onOpenFullDevoirConseil={() => setShowDevoirConseilModal(true)}
+            onUpdateLead={(updated) => {
+              if (onUpdateLead) onUpdateLead(updated);
+            }}
+          />
+        </div>
+      )}
 
         {/* Footer actions */}
         <div className="bg-slate-50 border-t border-slate-200 px-6 py-4 flex items-center justify-between">
-          <button
-            onClick={() => setShowDeleteLeadModal(true)}
-            className="px-3.5 py-2 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-bold rounded-xl border border-red-200 transition flex items-center gap-1.5 cursor-pointer"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>Supprimer le Lead</span>
-          </button>
+          {canDeleteLead ? (
+            <button
+              type="button"
+              onClick={() => setShowDeleteLeadModal(true)}
+              className="px-3.5 py-2 bg-red-50 hover:bg-red-100 text-red-700 text-xs font-bold rounded-xl border border-red-200 transition flex items-center gap-1.5 cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Supprimer le Lead</span>
+            </button>
+          ) : (
+            <div className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100/90 text-slate-500 rounded-xl text-xs font-medium border border-slate-200">
+              <Lock className="w-3.5 h-3.5 text-slate-400" />
+              <span>Suppression désactivée (droit non attribué)</span>
+            </div>
+          )}
 
           <button
             onClick={onClose}
-            className="px-5 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-xl transition"
+            className="px-5 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-xl transition cursor-pointer"
           >
             Fermer
           </button>
@@ -1180,10 +2008,18 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
                     <CheckCircle2 className="w-9 h-9" />
                   </div>
                   <h4 className="font-bold text-emerald-950 text-lg">
-                    Email Envoyé avec Succès via SMTP !
+                    {emailSendMethod === 'MAILTO' ? 'Client de messagerie ouvert avec succès !' : 'Email Envoyé avec Succès via SMTP !'}
                   </h4>
                   <p className="text-xs text-slate-600 max-w-md mx-auto leading-relaxed">
-                    L'email a été transmis directement à <strong className="font-bold text-slate-800">{lead.email}</strong> via votre serveur SMTP ({smtpConfig.host || 'configuré'}).
+                    {emailSendMethod === 'MAILTO' ? (
+                      <>
+                        Le modèle a été préparé et transmis à votre application de messagerie (Outlook, Thunderbird, Mail, etc.) pour envoi direct à <strong className="font-bold text-slate-800">{lead.email}</strong>.
+                      </>
+                    ) : (
+                      <>
+                        L'email a été transmis directement à <strong className="font-bold text-slate-800">{lead.email}</strong> via le serveur SMTP (<strong className="font-mono text-slate-800">{effectiveSmtpConfig.host || 'configuré'}</strong>).
+                      </>
+                    )}
                   </p>
                   <div className="inline-block px-3 py-1 bg-emerald-50 border border-emerald-200 rounded-full text-[11px] font-bold text-emerald-800">
                     Statut mis à jour : "Devis Envoyé"
@@ -1314,6 +2150,97 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
                     ></textarea>
                   </div>
 
+                  {/* Pied de page officiel du cabinet avec coordonnées */}
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-xs space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Building2 className="w-4 h-4 text-blue-600 shrink-0" />
+                        <span className="font-bold text-slate-800">
+                          Pied de page professionnel du cabinet
+                        </span>
+                        <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-md">
+                          Inclus automatiquement
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowEmailFooterPreview(!showEmailFooterPreview)}
+                        className="text-[11px] font-semibold text-blue-600 hover:text-blue-800 cursor-pointer"
+                      >
+                        {showEmailFooterPreview ? 'Masquer le pied de page ▲' : 'Aperçu du pied de page ▼'}
+                      </button>
+                    </div>
+
+                    <p className="text-[11px] text-slate-500">
+                      Vos coordonnées officielles ({cabinetInfo.nomCabinet || 'Cabinet'}, tél, courriel, adresse) ainsi que le N° ORIAS et les mentions réglementaires ACPR &amp; RGPD sont apposés automatiquement à l'envoi de chaque email.
+                    </p>
+
+                    {showEmailFooterPreview && (
+                      <div className="pt-2 border-t border-slate-200 bg-white p-3.5 rounded-lg border border-slate-200 text-[11px] space-y-2 shadow-2xs">
+                        {cabinetInfo.emailSignatureImageUrl && (!cabinetInfo.emailSignatureMode || cabinetInfo.emailSignatureMode === 'IMAGE') ? (
+                          <div className="space-y-1.5">
+                            <img
+                              src={cabinetInfo.emailSignatureImageUrl}
+                              alt="Signature Email"
+                              className="max-h-28 max-w-full object-contain rounded"
+                            />
+                            {cabinetInfo.numeroOrias && (
+                              <div className="text-[10px] text-slate-400">
+                                ORIAS N° {cabinetInfo.numeroOrias} • Courtage en assurance sous contrôle ACPR
+                              </div>
+                            )}
+                          </div>
+                        ) : cabinetInfo.emailSignatureImageUrl && cabinetInfo.emailSignatureMode === 'BOTH' ? (
+                          <div className="space-y-2">
+                            <img
+                              src={cabinetInfo.emailSignatureImageUrl}
+                              alt="Signature Email"
+                              className="max-h-24 max-w-full object-contain rounded"
+                            />
+                            <div className="pt-1.5 border-t border-slate-100 text-[10px] text-slate-400">
+                              {cabinetInfo.numeroOrias && <span className="font-bold text-blue-800 mr-2">ORIAS N° {cabinetInfo.numeroOrias}</span>}
+                              <span>{cabinetInfo.nomCabinet || 'Cabinet'} • ACPR &amp; RGPD</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="flex items-center justify-between">
+                              <div className="font-bold text-slate-900 text-xs">
+                                {senderDisplayName} • <span className="text-blue-600">{cabinetInfo.nomCabinet || 'Cabinet de Courtage'}</span>
+                              </div>
+                              {cabinetInfo.numeroOrias && (
+                                <span className="bg-blue-50 text-blue-800 border border-blue-200 text-[10px] px-2 py-0.5 rounded font-bold">
+                                  ORIAS N° {cabinetInfo.numeroOrias}
+                                </span>
+                              )}
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 text-slate-600">
+                              {cabinetInfo.telephone && (
+                                <div>📞 <strong>Tél :</strong> {cabinetInfo.telephone}</div>
+                              )}
+                              <div>✉️ <strong>Courriel :</strong> {effectiveSmtpConfig.senderEmail || cabinetInfo.emailContact || 'contact@cabinet.fr'}</div>
+                              {cabinetInfo.adresse && (
+                                <div className="sm:col-span-2">📍 <strong>Adresse :</strong> {cabinetInfo.adresse} {cabinetInfo.codePostal} {cabinetInfo.ville}</div>
+                              )}
+                              {cabinetInfo.siteWeb && (
+                                <div>🌐 <strong>Site web :</strong> {cabinetInfo.siteWeb}</div>
+                              )}
+                            </div>
+                            <div className="pt-2 border-t border-slate-100 text-[10px] text-slate-400 space-y-1">
+                              <div>
+                                Courtage en assurance sous le contrôle de l'ACPR (4 Place de Budapest, 75436 Paris).
+                                {cabinetInfo.siret ? ` • SIRET : ${cabinetInfo.siret}` : ''}
+                              </div>
+                              <div className="italic text-slate-400">
+                                🔒 Avis de confidentialité : message protégé par le secret professionnel et le RGPD.
+                              </div>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
                   {/* Pièces Jointes (Attachments) Section */}
                   <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-2.5">
                     <div className="flex items-center justify-between">
@@ -1330,21 +2257,6 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
                           onChange={handleFileAttachmentChange}
                           className="hidden"
                         />
-                      </label>
-                    </div>
-
-                    {/* Auto-attached PDF Quote Checkbox (Optionnel) */}
-                    <div className="flex items-center gap-2 p-2 bg-white rounded-lg border border-slate-200 text-xs">
-                      <input
-                        type="checkbox"
-                        id="inc-pdf"
-                        checked={includePdfQuote}
-                        onChange={(e) => setIncludePdfQuote(e.target.checked)}
-                        className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500 cursor-pointer"
-                      />
-                      <label htmlFor="inc-pdf" className="flex-1 font-bold text-slate-700 flex items-center gap-1.5 cursor-pointer">
-                        <FileText className="w-3.5 h-3.5 text-slate-500" />
-                        <span>Générer et joindre également le devis PDF récapitulatif ({lead.referenceDevis}.pdf)</span>
                       </label>
                     </div>
 
@@ -1385,11 +2297,68 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
                   )}
 
                   {/* Informational Guidance on Email Delivery */}
-                  <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-xl flex items-start gap-2.5 text-[11px] text-blue-950 leading-relaxed">
-                    <AlertCircle className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-                    <div>
-                      <span className="font-bold block mb-0.5">Envoi d'email direct via le CRM :</span>
-                      L'email sera transmis directement à <strong className="font-bold text-blue-900">{lead.email}</strong> via votre serveur SMTP ({smtpConfig.host || 'non configuré'}). Vous pouvez joindre librement vos propres fichiers ci-dessus.
+                  <div className="p-3.5 bg-blue-50/90 border border-blue-200 rounded-xl space-y-2 text-[11px] text-blue-950">
+                    <div className="flex items-start justify-between flex-wrap gap-2">
+                      <div className="flex items-center gap-2">
+                        <Server className="w-4 h-4 text-blue-600 shrink-0" />
+                        <span className="font-bold">
+                          Expéditeur : {effectiveSmtpConfig.senderName || senderDisplayName} {effectiveSmtpConfig.senderEmail ? `<${effectiveSmtpConfig.senderEmail}>` : ''}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-1.5">
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                          smtpSourceInfo.type === 'CABINET'
+                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                            : smtpSourceInfo.type === 'USER'
+                            ? 'bg-blue-100 text-blue-800 border border-blue-300'
+                            : smtpSourceInfo.type === 'ASSIGNED'
+                            ? 'bg-purple-100 text-purple-800 border border-purple-300'
+                            : 'bg-rose-100 text-rose-800 border border-rose-300'
+                        }`}>
+                          {smtpSourceInfo.label}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Switcher if multiple servers are available */}
+                    {availableSmtpOptions.hasCabinet && availableSmtpOptions.hasUser && (
+                      <div className="flex items-center gap-2 pt-1 border-t border-blue-200/60">
+                        <span className="text-[10px] font-semibold text-slate-500">Choisir le serveur :</span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedSmtpChoice('CABINET')}
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold transition flex items-center gap-1 ${
+                              smtpSourceInfo.type === 'CABINET'
+                                ? 'bg-blue-600 text-white shadow-2xs'
+                                : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200'
+                            }`}
+                          >
+                            <Building2 className="w-3 h-3" />
+                            <span>SMTP Cabinet ({availableSmtpOptions.cabinetHost})</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => setSelectedSmtpChoice('USER')}
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold transition flex items-center gap-1 ${
+                              smtpSourceInfo.type === 'USER'
+                                ? 'bg-blue-600 text-white shadow-2xs'
+                                : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200'
+                            }`}
+                          >
+                            <UserCheck className="w-3 h-3" />
+                            <span>SMTP Dédié ({availableSmtpOptions.userHost})</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="text-slate-600 leading-relaxed text-[11px] pt-1 border-t border-blue-200/60">
+                      Serveur sortant : <strong className="font-mono text-slate-800 font-bold">{effectiveSmtpConfig.host || 'Non configuré'}</strong> (Port {effectiveSmtpConfig.port || 587}, {effectiveSmtpConfig.encryption || 'TLS'})
+                      • Identifiant : <strong className="font-mono text-slate-800">{effectiveSmtpConfig.username || 'Non renseigné'}</strong>
+                      • Envoi direct à <strong className="text-blue-900 font-bold">{lead.email}</strong>.
                     </div>
                   </div>
                 </>
@@ -1397,408 +2366,54 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
             </div>
 
             {/* Fixed Footer */}
-            <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-200 flex items-center justify-between shrink-0 gap-2">
+            <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-200 flex flex-col sm:flex-row items-center justify-between shrink-0 gap-3">
               <button
                 onClick={() => setShowEmailModal(false)}
                 disabled={isSendingEmail}
-                className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-xl cursor-pointer transition disabled:opacity-50"
+                className="w-full sm:w-auto px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-xl cursor-pointer transition disabled:opacity-50"
               >
                 Annuler
               </button>
 
               {!emailSuccessMsg && (
-                <button
-                  onClick={() => handleSendEmailAction('DIRECT')}
-                  disabled={isSendingEmail}
-                  className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl shadow-lg flex items-center gap-2 cursor-pointer transition disabled:opacity-50"
-                  title="Envoie directement l'email via le serveur SMTP enregistré dans les paramètres"
-                >
-                  {isSendingEmail ? (
-                    <>
-                      <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                      <span>Envoi SMTP en cours...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Send className="w-4 h-4" />
-                      <span>Envoyer l'email par SMTP</span>
-                    </>
-                  )}
-                </button>
+                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
+                  <button
+                    onClick={() => handleSendEmailAction('MAILTO')}
+                    disabled={isSendingEmail}
+                    className="flex-1 sm:flex-initial px-4 py-2.5 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 text-xs font-bold rounded-xl shadow-2xs flex items-center justify-center gap-2 cursor-pointer transition disabled:opacity-50"
+                    title="Ouvre votre logiciel de messagerie (Outlook, Thunderbird, Apple Mail, Webmail) avec le texte et l'objet pré-remplis"
+                  >
+                    <Mail className="w-4 h-4 text-slate-600" />
+                    <span>Ouvrir dans ma messagerie</span>
+                  </button>
+
+                  <button
+                    onClick={() => handleSendEmailAction('DIRECT')}
+                    disabled={isSendingEmail}
+                    className="flex-1 sm:flex-initial px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl shadow-lg flex items-center justify-center gap-2 cursor-pointer transition disabled:opacity-50"
+                    title={effectiveSmtpConfig.host ? `Envoie directement l'email via le serveur SMTP (${effectiveSmtpConfig.host})` : "Nécessite la configuration d'un serveur SMTP dans les paramètres"}
+                  >
+                    {isSendingEmail ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                        <span>Envoi SMTP en cours...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Send className="w-4 h-4" />
+                        <span>Envoyer par SMTP direct</span>
+                      </>
+                    )}
+                  </button>
+                </div>
               )}
             </div>
           </div>
         </div>
       )}
 
-      {/* PRINT QUOTE MODAL */}
-      {showQuotePreview && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-5 overflow-hidden">
-          <div className="bg-white w-full max-w-4xl max-h-[94vh] rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col">
-            <div className="bg-slate-900 text-white px-6 py-4 flex items-center justify-between shrink-0">
-              <h3 className="font-bold text-base flex items-center gap-2">
-                <Printer className="w-5 h-5 text-emerald-400" />
-                Document Devis Officiel - {lead.referenceDevis}
-              </h3>
-              <button onClick={() => setShowQuotePreview(false)} className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="p-6 sm:p-8 overflow-y-auto flex-1 space-y-6 text-slate-900 font-sans" id="printable-quote">
-              {/* Entête Cabinet / Devis avec Logo */}
-              <div className="flex flex-col sm:flex-row justify-between items-start border-b-2 border-slate-900 pb-6 gap-4">
-                <div className="flex items-start gap-4">
-                  {cabinetInfo.logoUrl ? (
-                    <img
-                      src={cabinetInfo.logoUrl}
-                      alt={cabinetInfo.nomCabinet}
-                      className="h-16 max-w-[220px] object-contain rounded-lg border border-slate-200 p-1 bg-white shadow-sm"
-                    />
-                  ) : (
-                    <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-700 via-blue-800 to-indigo-950 text-white flex items-center justify-center font-black text-2xl shadow-md border border-blue-400/30 shrink-0">
-                      {cabinetInfo.nomCabinet ? cabinetInfo.nomCabinet.charAt(0) : 'H'}
-                    </div>
-                  )}
-                  <div>
-                    <div className="flex items-center gap-2 mb-0.5 flex-wrap">
-                      <h2 className="text-xl font-black text-slate-900 tracking-tight">{cabinetInfo.nomCabinet}</h2>
-                      <span className="px-2 py-0.5 bg-blue-100 text-blue-800 text-[10px] font-black uppercase tracking-wider rounded-md border border-blue-200">
-                        ORIAS N° {cabinetInfo.numeroOrias}
-                      </span>
-                    </div>
-                    <p className="text-xs font-bold text-blue-700 mb-1">Cabinet de Courtage & Conseils en Assurances</p>
-                    <p className="text-[11px] text-slate-600 leading-relaxed">
-                      {cabinetInfo.adresse} — {cabinetInfo.codePostal} {cabinetInfo.ville}<br />
-                      N° SIRET : {cabinetInfo.siret || '842 194 028 00012'} | Tél : <strong>{cabinetInfo.telephone}</strong> | Email : {cabinetInfo.emailContact || cabinetInfo.nomCourtierPrincipal}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="sm:text-right bg-gradient-to-br from-blue-50 to-slate-50 p-4 rounded-xl border border-blue-200 min-w-[240px] shadow-sm">
-                  <span className="inline-block px-2.5 py-0.5 bg-blue-600 text-white text-[10px] font-black uppercase tracking-wider rounded-md mb-1">
-                    PROPOSITION COMMERCIALE
-                  </span>
-                  <h3 className="text-lg font-black text-blue-950">DEVIS N° {lead.referenceDevis}</h3>
-                  <p className="text-xs font-semibold text-slate-700">Émis le : {new Date().toLocaleDateString('fr-FR')}</p>
-                  <p className="text-xs text-emerald-700 font-bold mt-1">Validité : 30 jours (sous réserve de pièces)</p>
-                </div>
-              </div>
-
-              {/* Grid Client / Intermédiaire */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-                <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-1">
-                  <h4 className="text-[11px] font-black uppercase text-slate-500 tracking-wider mb-2 flex items-center gap-1.5">
-                    <UserCheck className="w-4 h-4 text-blue-600" />
-                    PROSPECT SOUSCRIPTEUR
-                  </h4>
-                  <p className="font-bold text-sm text-slate-900">{getLeadCivility(lead)} {lead.prenom} {lead.nom}</p>
-                  <p className="text-slate-700"><strong>Adresse :</strong> {lead.autoDetails?.adresse || lead.habitationDetails?.adresse || lead.vtcDetails?.adresse || lead.ville} ({lead.codePostal})</p>
-                  <p className="text-slate-700"><strong>Téléphone :</strong> {lead.telephone}</p>
-                  <p className="text-slate-700"><strong>Email :</strong> {lead.email}</p>
-                </div>
-
-                <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-1">
-                  <h4 className="text-[11px] font-black uppercase text-slate-500 tracking-wider mb-2 flex items-center gap-1.5">
-                    <ShieldCheck className="w-4 h-4 text-blue-600" />
-                    CONSEILLER COURTIER DÉDIÉ
-                  </h4>
-                  <p className="font-bold text-sm text-slate-900">{cabinetInfo.nomCourtierPrincipal || 'Service Client'}</p>
-                  <p className="text-slate-700"><strong>Organisme :</strong> {cabinetInfo.nomCabinet}</p>
-                  <p className="text-slate-700"><strong>N° Registre ORIAS :</strong> {cabinetInfo.numeroOrias}</p>
-                  <p className="text-slate-700"><strong>Statut :</strong> Courtier d'Assurances indépendant (Cat. b)</p>
-                </div>
-              </div>
-
-              {/* FICHE DE DEVOIR DE CONSEIL (DDA - Art. L. 521-4 du Code des Assurances) */}
-              <div className="p-4 bg-amber-50/70 rounded-xl border border-amber-200 text-xs space-y-2">
-                <div className="flex items-center gap-2 border-b border-amber-200/80 pb-2">
-                  <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0" />
-                  <h4 className="font-black uppercase text-amber-950 tracking-wider">
-                    FICHE DU DEVOIR DE CONSEIL ET D'INFORMATION (Art. L. 521-4 du Code des Assurances - Directive DDA)
-                  </h4>
-                </div>
-                <p className="text-[11px] text-amber-900 leading-relaxed">
-                  Conformément à la réglementation française sur la distribution d'assurances, le présent conseil est personnalisé sur la base des exigences et besoins déclarés par le souscripteur :
-                </p>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-[11px] pt-1">
-                  <div className="bg-white p-2.5 rounded-lg border border-amber-200/60">
-                    <p className="font-bold text-amber-900 mb-0.5">1. Exigences & Besoins :</p>
-                    <p className="text-slate-700">Recherche d'une formule {getQuotePricing(lead).formula} adaptée au risque {lead.type} avec option de règlement {getQuotePricing(lead).fractionnement.toLowerCase()}.</p>
-                  </div>
-                  <div className="bg-white p-2.5 rounded-lg border border-amber-200/60">
-                    <p className="font-bold text-amber-900 mb-0.5">2. Motivation du Conseil :</p>
-                    <p className="text-slate-700">L'offre sélectionnée présente le meilleur rapport garanties/prix selon votre profil CRM, l'usage du bien et vos besoins d'assistance 24/7.</p>
-                  </div>
-                  <div className="bg-white p-2.5 rounded-lg border border-amber-200/60">
-                    <p className="font-bold text-amber-900 mb-0.5">3. Statut & Transparence :</p>
-                    <p className="text-slate-700">Courtier indépendant de rang 1 sans obligation d'exclusivité. Rémunération intégrée à la prime globale et/ou frais de courtage indiqués.</p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Fiche Risque & Caractéristiques Détaillées */}
-              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-3">
-                <h4 className="text-xs font-black uppercase text-slate-800 tracking-wider border-b pb-2 flex items-center gap-2">
-                  {lead.type === 'AUTO' && <Car className="w-4 h-4 text-blue-600" />}
-                  {lead.type === 'HABITATION' && <Home className="w-4 h-4 text-blue-600" />}
-                  {lead.type === 'VTC' && <Briefcase className="w-4 h-4 text-blue-600" />}
-                  DÉSIGNATION ET DÉTAILS DU RISQUE ASSURÉ ({lead.type})
-                </h4>
-
-                {lead.type === 'AUTO' && lead.autoDetails && (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 leading-relaxed">
-                    <div className="space-y-1 bg-white p-3 rounded-lg border border-slate-200">
-                      <p className="font-bold text-blue-900 border-b pb-1 mb-1">🚘 Caractéristiques Véhicule :</p>
-                      <p><strong>Marque & Modèle :</strong> {lead.autoDetails.marqueModele || 'Non précisé'}</p>
-                      <p><strong>Immatriculation :</strong> <span className="font-mono font-bold bg-slate-100 px-1.5 py-0.5 rounded">{lead.autoDetails.immatriculation || 'En cours'}</span></p>
-                      <p><strong>1ère Mise en Circulation :</strong> {lead.autoDetails.dateMiseEnCirculation || 'N/A'}</p>
-                      <p><strong>Usage Déclaré :</strong> {lead.autoDetails.typeUtilisation || 'Trajet travail'}</p>
-                      <p><strong>Propriétaire :</strong> {lead.autoDetails.proprietaireVehicule || 'Conducteur principal'}</p>
-                    </div>
-
-                    <div className="space-y-1 bg-white p-3 rounded-lg border border-slate-200">
-                      <p className="font-bold text-blue-900 border-b pb-1 mb-1">👤 Conducteur & Antécédents CRM :</p>
-                      <p><strong>Permis de Conduire :</strong> Permis B du {lead.autoDetails.datePermis || 'N/A'}</p>
-                      <p><strong>Bonus / Malus (CRM) :</strong> <span className="font-bold text-emerald-700">{lead.autoDetails.bonusMalus ?? 0.50}</span></p>
-                      <p><strong>Mois assurés 36 derniers mois :</strong> {lead.autoDetails.nombreMoisAssure36Mois ?? 36} mois</p>
-                      <p><strong>Suspension / Annulation :</strong> {lead.autoDetails.aEuSuspensionPermis ? 'Oui (Suspension)' : lead.autoDetails.aEuAnnulationPermis ? 'Oui (Annulation)' : 'Non'}</p>
-                      <p><strong>Sinistres déclarés (36m) :</strong> {lead.autoDetails.sinistres?.length ? `${lead.autoDetails.sinistres.length} sinistre(s)` : 'Aucun sinistre'}</p>
-                    </div>
-                  </div>
-                )}
-
-                {lead.type === 'VTC' && lead.vtcDetails && (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 leading-relaxed">
-                    <div className="space-y-1 bg-white p-3 rounded-lg border border-slate-200">
-                      <p className="font-bold text-blue-900 border-b pb-1 mb-1">🚕 Entreprise VTC & Véhicule :</p>
-                      <p><strong>Société :</strong> {lead.vtcDetails.nomSociete || 'Auto-entrepreneur'} (SIRET : {lead.vtcDetails.siret || 'N/A'})</p>
-                      <p><strong>Carte Pro VTC N° :</strong> {lead.vtcDetails.numeroCarteVtc || 'N/A'}</p>
-                      <p><strong>Véhicule :</strong> {lead.vtcDetails.marqueModele || 'N/A'} ({lead.vtcDetails.immatriculation || 'N/A'})</p>
-                      <p><strong>Motorisation :</strong> {lead.vtcDetails.typeMotorisation || 'Hybride'}</p>
-                    </div>
-
-                    <div className="space-y-1 bg-white p-3 rounded-lg border border-slate-200">
-                      <p className="font-bold text-blue-900 border-b pb-1 mb-1">🛡️ Activité Pro & Antécédents :</p>
-                      <p><strong>RC Pro Exploitation :</strong> {lead.vtcDetails.besoinRcProExploitation ? 'INCLUSE' : 'Non souscrite'}</p>
-                      <p><strong>Bonus / Malus :</strong> {lead.vtcDetails.bonusMalus ?? 0.50}</p>
-                      <p><strong>Dernier Assureur :</strong> {lead.vtcDetails.nomDerniereCompagnie || 'N/A'}</p>
-                      <p><strong>Sinistralité :</strong> {lead.vtcDetails.sinistres?.length ? `${lead.vtcDetails.sinistres.length} sinistre(s)` : 'Aucun sinistre'}</p>
-                    </div>
-                  </div>
-                )}
-
-                {lead.type === 'HABITATION' && lead.habitationDetails && (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 leading-relaxed">
-                    <div className="space-y-1 bg-white p-3 rounded-lg border border-slate-200">
-                      <p className="font-bold text-blue-900 border-b pb-1 mb-1">🏡 Caractéristiques du Logement :</p>
-                      <p><strong>Type de Bien :</strong> {lead.habitationDetails.typeLogement || 'Maison'} ({lead.habitationDetails.statutOccupant || 'Occupant'})</p>
-                      <p><strong>Surface Habitable :</strong> {lead.habitationDetails.surfaceM2 || 0} m² ({lead.habitationDetails.nombrePieces || 0} pièces principales)</p>
-                      <p><strong>Adresse du Bien :</strong> {lead.habitationDetails.adresseBien || lead.ville}</p>
-                      <p><strong>Équipements :</strong> {lead.habitationDetails.dependances ? 'Dépendances ' : ''}{lead.habitationDetails.piscine ? 'Piscine ' : ''}{!lead.habitationDetails.dependances && !lead.habitationDetails.piscine ? 'Aucun' : ''}</p>
-                    </div>
-
-                    <div className="space-y-1 bg-white p-3 rounded-lg border border-slate-200">
-                      <p className="font-bold text-blue-900 border-b pb-1 mb-1">💰 Capital Garanti & Antécédents :</p>
-                      <p><strong>Valeur Mobilier Garanti :</strong> <span className="font-bold text-emerald-700">{lead.habitationDetails.valeurMobilier || 0} €</span></p>
-                      <p><strong>Résidence :</strong> {lead.habitationDetails.residencePrincipale ? 'Principale' : 'Secondaire'}</p>
-                      <p><strong>Déjà Assuré :</strong> {lead.habitationDetails.dejaAssure ? 'Oui' : 'Non'}</p>
-                      <p><strong>Sinistres antérieurs :</strong> {lead.habitationDetails.sinistres?.length ? `${lead.habitationDetails.sinistres.length} sinistre(s)` : 'Aucun'}</p>
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Table Tarification / Cotisation */}
-              <div>
-                <h4 className="text-xs font-black uppercase text-slate-800 tracking-wider mb-2">
-                  💶 DÉTAIL DE LA PROPOSITION TARIFAIRE
-                </h4>
-                <div className="overflow-hidden rounded-xl border border-slate-200">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-slate-800 text-white font-bold uppercase">
-                      <tr>
-                        <th className="p-3">Formule d'Assurance Choisie</th>
-                        <th className="p-3 text-center">Périodicité</th>
-                        <th className="p-3 text-right">Cotisation TTC</th>
-                        <th className="p-3 text-right">Frais de Dossier</th>
-                        <th className="p-3 text-right bg-blue-900">Premier Règlement</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-200 bg-white">
-                      <tr>
-                        <td className="p-3 font-bold text-slate-900">
-                          {getQuotePricing(lead).formula}
-                          <span className="block text-[10px] text-slate-500 font-normal">Secteur {lead.type}</span>
-                        </td>
-                        <td className="p-3 text-center font-bold text-blue-800">{getQuotePricing(lead).fractionnement}</td>
-                        <td className="p-3 text-right font-bold text-emerald-700 text-sm">{getQuotePricing(lead).cotisation.toFixed(2)} €</td>
-                        <td className="p-3 text-right font-semibold text-slate-800">{getQuotePricing(lead).fraisDossier.toFixed(2)} €</td>
-                        <td className="p-3 text-right font-black text-blue-950 bg-blue-50/50 text-sm">
-                          {(getQuotePricing(lead).cotisation + getQuotePricing(lead).fraisDossier).toFixed(2)} € TTC
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              {/* Tableau Détaillé des Garanties & Franchises */}
-              <div>
-                <h4 className="text-xs font-black uppercase text-slate-800 tracking-wider mb-2">
-                  🛡️ TABLEAU DÉTAILLÉ DES GARANTIES & FRANCHISES INCLUSES
-                </h4>
-                <div className="overflow-hidden rounded-xl border border-slate-200">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-slate-100 text-slate-800 font-bold uppercase border-b">
-                      <tr>
-                        <th className="p-2.5">Garantie / Couverture</th>
-                        <th className="p-2.5 text-center">Statut</th>
-                        <th className="p-2.5">Plafond & Conditions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-200 bg-white">
-                      {getGuaranteesList(lead).map((g, idx) => (
-                        <tr key={idx} className="hover:bg-slate-50/50">
-                          <td className="p-2.5 font-bold text-slate-900">{g.name}</td>
-                          <td className="p-2.5 text-center">
-                            <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${
-                              String(g.included).includes('Inclus') 
-                                ? 'bg-emerald-100 text-emerald-800' 
-                                : String(g.included).includes('option')
-                                ? 'bg-amber-100 text-amber-800'
-                                : 'bg-slate-100 text-slate-500'
-                            }`}>
-                              {String(g.included)}
-                            </span>
-                          </td>
-                          <td className="p-2.5 text-slate-600 text-[11px]">{g.detail}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-
-              {/* CONDITIONS GÉNÉRALES ET DISPOSITIONS LÉGALES (LOI FRANÇAISE) */}
-              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-3">
-                <div className="flex items-center gap-2 border-b pb-2">
-                  <FileText className="w-4 h-4 text-blue-700 shrink-0" />
-                  <h4 className="font-black uppercase text-slate-900 tracking-wider">
-                    CONDITIONS GÉNÉRALES ET DISPOSITIONS LÉGALES (Loi & Réglementation Française)
-                  </h4>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px] leading-relaxed text-slate-700">
-                  <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
-                    <p className="font-bold text-xs text-blue-900">1. Droit de Rétractation / Renonciation (Art. L. 112-9)</p>
-                    <p>Pour les souscriptions à distance ou hors établissement, vous disposez d'un délai légal de <strong>14 jours calendaires révolus</strong> à compter de la conclusion du contrat pour renoncer à votre souscription sans frais ni motif.</p>
-                  </div>
-
-                  <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
-                    <p className="font-bold text-xs text-blue-900">2. Résiliation Infra-Annuelle (Loi Hamon & Châtel)</p>
-                    <p>Contrat souscrit pour une durée d'un an avec reconduction tacite. Après la première année de souscription, vous pouvez résilier <strong>à tout moment sans frais ni pénalités</strong>.</p>
-                  </div>
-
-                  <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
-                    <p className="font-bold text-xs text-blue-900">3. Obligation de Déclaration du Risque (Art. L. 113-2)</p>
-                    <p>Le souscripteur doit répondre exactement aux questions. Toute fausse déclaration intentionnelle entraîne la <strong>nullité du contrat (Art. L. 113-8)</strong> ou l'application de la règle proportionnelle de prime (Art. L. 113-9).</p>
-                  </div>
-
-                  <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
-                    <p className="font-bold text-xs text-blue-900">4. Protection des Données Personnelles (RGPD / CNIL)</p>
-                    <p>Les données sont traitées conformément au RGPD pour la gestion du contrat. Vous disposez d'un droit d'accès, de rectification et d'opposition auprès du cabinet {cabinetInfo.nomCabinet}.</p>
-                  </div>
-
-                  <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
-                    <p className="font-bold text-xs text-blue-900">5. Réclamations & Médiation de l'Assurance</p>
-                    <p>En cas de désaccord, contacter d'abord le cabinet à {cabinetInfo.emailContact || cabinetInfo.telephone}. En cas de litige : <em>La Médiation de l'Assurance, TSA 50110, 75441 Paris Cedex 09 (www.mediation-assurance.org)</em>.</p>
-                  </div>
-
-                  <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1">
-                    <p className="font-bold text-xs text-blue-900">6. Organisme de Contrôle (ACPR)</p>
-                    <p>Cabinet sous le contrôle de l'<strong>ACPR (Autorité de Contrôle Prudentiel et de Résolution)</strong>, 4 Place de Budapest, 75436 Paris Cedex 09.</p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Pièces à fournir & Engagement */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-[11px]">
-                <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-1.5">
-                  <h5 className="font-bold text-slate-900 border-b pb-1 text-xs">📄 Pièces nécessaires pour la souscription :</h5>
-                  <ul className="list-disc list-inside space-y-1 text-slate-700">
-                    <li>Permis de conduire recto/verso (ou Carte VTC)</li>
-                    <li>Certificat d'immatriculation (Carte Grise)</li>
-                    <li>Relevé d'Information Intégral 36 mois</li>
-                    <li>Relevé d'Identité Bancaire (RIB) pour prélèvement</li>
-                  </ul>
-                </div>
-
-                <div className="p-3.5 bg-blue-50/60 rounded-xl border border-blue-200 space-y-2">
-                  <h5 className="font-bold text-blue-950 text-xs">✍️ Validation & Bon pour Accord :</h5>
-                  <p className="text-slate-600 leading-snug">
-                    Je soussigné(e) <strong>{getLeadCivility(lead)} {lead.prenom} {lead.nom}</strong>, confirme l'exactitude des renseignements ci-dessus, reconnaît avoir reçu la fiche de devoir de conseil ainsi que les conditions générales réglementaires, et valide la proposition N° {lead.referenceDevis}.
-                  </p>
-                  <div className="pt-4 border-t border-blue-200 flex justify-between text-[10px] text-slate-500 font-mono">
-                    <span>Fait à : ....................</span>
-                    <span>Le : ..../..../202...</span>
-                  </div>
-                  <div className="h-10 border border-dashed border-blue-300 rounded-lg flex items-center justify-center text-slate-400 text-[10px] italic">
-                    Emplacement Signature ("Lu et approuvé - Bon pour accord")
-                  </div>
-                </div>
-              </div>
-
-              {/* Mentions Légales Pied de Page */}
-              <div className="text-[10px] text-slate-500 border-t pt-4 leading-relaxed space-y-1">
-                <p><strong>Information Légale :</strong> {cabinetInfo.mentionsLegales || `Cabinet d'assurance agréé ORIAS N° ${cabinetInfo.numeroOrias}. Activité sous le contrôle de l'ACPR.`}</p>
-                <p className="italic">Document non contractuel établi selon les déclarations du prospect. Sous réserve de validation définitive des pièces justificatives.</p>
-              </div>
-            </div>
-
-            {/* Footer buttons */}
-            <div className="p-4 bg-slate-100 border-t flex flex-wrap justify-between items-center gap-3 shrink-0">
-              <span className="text-xs text-slate-500 font-medium">Référence : {lead.referenceDevis}</span>
-              <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-                <button
-                  onClick={() => setShowQuotePreview(false)}
-                  className="px-3.5 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-xl transition cursor-pointer"
-                >
-                  Fermer
-                </button>
-
-                <button
-                  onClick={handleDownloadQuoteTxt}
-                  className="px-3.5 py-2 bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow flex items-center gap-1.5 cursor-pointer transition"
-                  title="Télécharger la version texte du devis"
-                >
-                  <Download className="w-3.5 h-3.5 text-slate-300" />
-                  <span>Texte (.txt)</span>
-                </button>
-
-                <button
-                  onClick={handleDownloadQuoteHTML}
-                  className="px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl shadow flex items-center gap-1.5 cursor-pointer transition"
-                  title="Télécharger le fichier HTML complet avec mise en page"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Télécharger HTML</span>
-                </button>
-
-                <button
-                  onClick={handlePrintQuote}
-                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl shadow flex items-center gap-2 cursor-pointer transition"
-                >
-                  <Printer className="w-4 h-4" />
-                  <span>Imprimer / PDF</span>
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
       {/* DELETE LEAD MODAL */}
-      {showDeleteLeadModal && (
+      {showDeleteLeadModal && canDeleteLead && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 border border-slate-200 shadow-2xl space-y-4 animate-in fade-in zoom-in-95">
             <div className="flex items-center gap-3">
@@ -1826,6 +2441,10 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
               <button
                 type="button"
                 onClick={() => {
+                  if (!canDeleteLead) {
+                    setShowDeleteLeadModal(false);
+                    return;
+                  }
                   onDeleteLead(lead.id);
                   setShowDeleteLeadModal(false);
                   onClose();
@@ -1838,6 +2457,35 @@ export const LeadDetailsView: React.FC<LeadDetailsViewProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Click-to-Call Telephony Modal */}
+      {showTelephonyModal && (
+        <TelephonyModal
+          isOpen={showTelephonyModal}
+          onClose={() => setShowTelephonyModal(false)}
+          lead={lead}
+          currentUser={currentUser}
+          cabinetInfo={cabinetInfo}
+          onUpdateLead={(updated) => {
+            if (onUpdateLead) onUpdateLead(updated);
+          }}
+        />
+      )}
+
+      {/* Official Devoir de Conseil (DDA 2026) Modal */}
+      {showDevoirConseilModal && (
+        <DevoirConseilModal
+          isOpen={showDevoirConseilModal}
+          onClose={() => setShowDevoirConseilModal(false)}
+          lead={lead}
+          cabinetInfo={cabinetInfo}
+          currentUser={currentUser}
+          smtpConfig={effectiveSmtpConfig}
+          onUpdateLead={(updated) => {
+            if (onUpdateLead) onUpdateLead(updated);
+          }}
+        />
       )}
     </div>
   );
